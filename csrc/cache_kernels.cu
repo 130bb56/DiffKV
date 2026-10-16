@@ -589,7 +589,7 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
 
     // Write score to cache.
     const int64_t score_offset = dst_physical_block_number * unified_page_size + SCORE_BASE_LOW;
-    *reinterpret_cast<float*>(&kv_cache[score_offset + token_idx_within_the_page * 2]) = s_scores[token_idx];
+    *reinterpret_cast<float*>(&kv_cache[score_offset + token_idx_within_the_page * 2]) = s_scores[s_positions[token_idx]];
 
     // Write position to cache.
     int ideal_num_queries = prompt_len - s_positions[token_idx];
@@ -719,7 +719,7 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
 
     // Write score to cache.
     const int64_t score_offset = dst_physical_block_number * unified_page_size + SCORE_BASE_HIGH;
-    *reinterpret_cast<float*>(&kv_cache[score_offset + token_idx_within_the_page * 2]) = s_scores[token_idx];
+    *reinterpret_cast<float*>(&kv_cache[score_offset + token_idx_within_the_page * 2]) = s_scores[s_positions[token_idx]];
 
     // Write position to cache.
     int ideal_num_queries = prompt_len - s_positions[token_idx];
