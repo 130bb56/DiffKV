@@ -289,3 +289,142 @@ Prefill Throughput = input tokens / summed prefill engine.step time. Decode Thro
 | **(512, 512, 8)** | **866.254** / 893.473 | **22.704** / 34.030 | **4729.734** / 4584.481 | **352.550** / 235.172 | **12.468** / 18.283 |
 
 두 경로 모두 8개 요청에서 각각 512 tokens를 생성했고, 모든 Decode step의 동시 요청 수도 8개로 같았습니다. Recompute는 두 경로 모두 0회였습니다. Prefill 시간은 0.866초, 0.893초로 비슷했지만, Decode 시간은 11.596초, 17.383초로 DiffKV가 더 길었습니다. 따라서 이 case의 E2E Latency 차이는 Decode 구간에서 발생했습니다.
+
+
+## Llama3-8B Base, Offline Synthetic, optimized DiffKV, Run 20261016-134916-315827
+
+- Started: 2026-10-16T13:49:16+09:00
+- Model: /home/130bb56/DiffKV/.cache/models/Meta-Llama-3-8B
+- GPU: 0
+- Physical GPUs: [0]
+- GPU mapping: all 27 cases use GPU 0
+- DiffKV variant: no-sync-bulk-lengths
+- ISL: [512, 1024, 2048], OSL: [512, 1024, 2048], B: [8, 16, 32]
+- Measured batches per case: 1
+- Warmup output length: 16
+- Logs: /home/130bb56/DiffKV/logs/performance/offline-optimized-grid-20261016-134916-315827
+- Resume command: /home/130bb56/DiffKV/.cache/baselines/fp16-env/bin/python /home/130bb56/DiffKV/benchmarks/resume_offline_gpu0.py --run-dir /home/130bb56/DiffKV/logs/performance/offline-optimized-grid-20261016-134916-315827
+
+위 resume 명령은 당시 실행 기록입니다. `resume_offline_gpu0.py`는 현재 삭제했으며, 현재 [run_offline_e2e.py](./benchmarks/run_offline_e2e.py#L742)의 `--case-indices`로 조건을 선택해 새 output directory에서 실행할 수 있습니다. 기존 결과 폴더 재개 명령과는 구분합니다.
+
+Each cell is **FP16 / DiffKV**. All 27 cases were measured on physical GPU 0. The original 13 GPU 0 cases are retained; the 14 former GPU 1 cases have been replaced with GPU 0 remeasurements.
+
+TTFT and TPOT are request means. Prefill Throughput = input tokens / summed prefill engine.step time. Decode Throughput = B * (OSL - 1) / summed decode engine.step time. E2E measures the complete generation call, excluding loading and warmup. Lower latency and higher throughput are **bold**. OOM means insufficient capacity for the fixed workload. Engine limits remain max_model_len=4096, max_num_seqs=32, max_num_batched_tokens=8192.
+
+| Case (ISL, OSL, B) | TTFT (ms) | TPOT (ms/token) | Prefill Throughput (tok/s) | Decode Throughput (tok/s) | E2E Latency (s) |
+|---|---:|---:|---:|---:|---:|
+| (2048, 2048, 32) | OOM / 8282.602 | OOM / 63.193 | OOM / 4447.146 | OOM / 533.284 | OOM / 137.640 |
+| (2048, 1024, 32) | OOM / 8343.259 | OOM / 63.423 | OOM / 4415.340 | OOM / 561.042 | OOM / 73.225 |
+| (2048, 512, 32) | OOM / 8139.391 | OOM / 63.565 | OOM / 4523.455 | OOM / 626.131 | OOM / 40.622 |
+| (1024, 2048, 32) | OOM / 4404.923 | OOM / 50.309 | OOM / 4646.063 | OOM / 653.315 | OOM / 107.389 |
+| (1024, 1024, 32) | OOM / 4472.874 | OOM / 48.011 | OOM / 4577.691 | OOM / 705.653 | OOM / 53.588 |
+| (1024, 512, 32) | OOM / 4443.084 | OOM / 46.442 | OOM / 4605.281 | OOM / 777.030 | OOM / 28.176 |
+| (512, 2048, 32) | OOM / 2620.674 | OOM / 44.724 | OOM / 4689.964 | OOM / 722.918 | OOM / 94.172 |
+| (512, 1024, 32) | OOM / 2631.999 | OOM / 40.176 | OOM / 4668.479 | OOM / 814.515 | OOM / 43.733 |
+| (512, 512, 32) | **2615.300** / 2631.166 | 41.627 / **38.368** | **4699.714** / 4669.303 | 802.180 / **873.813** | 23.888 / **22.238** |
+| (2048, 2048, 16) | OOM / 4575.167 | OOM / 43.881 | OOM / 4471.380 | OOM / 376.335 | OOM / 94.400 |
+| (2048, 1024, 16) | OOM / 4581.346 | OOM / 43.699 | OOM / 4468.597 | OOM / 390.347 | OOM / 49.286 |
+| (2048, 512, 16) | OOM / 4585.709 | OOM / 43.876 | OOM / 4464.867 | OOM / 415.917 | OOM / 27.007 |
+| (1024, 2048, 16) | OOM / 2661.017 | OOM / 39.209 | OOM / 4617.344 | OOM / 412.834 | OOM / 82.922 |
+| (1024, 1024, 16) | **2627.915** / 2658.425 | 40.136 / **35.680** | **4676.753** / 4621.905 | 407.523 / **459.831** | 43.689 / **39.160** |
+| (1024, 512, 16) | **2632.449** / 2663.908 | 36.785 / **34.765** | **4669.750** / 4612.950 | 456.477 / **484.705** | 21.431 / **20.430** |
+| (512, 2048, 16) | OOM / 1740.503 | OOM / 35.905 | OOM / 4706.784 | OOM / 445.857 | OOM / 75.238 |
+| (512, 1024, 16) | **1744.270** / 1750.370 | 34.071 / **32.555** | **4697.893** / 4680.256 | 469.872 / **491.763** | 36.599 / **35.055** |
+| (512, 512, 16) | **1731.394** / 1751.878 | **28.622** / 30.565 | **4732.836** / 4676.229 | **559.344** / 523.772 | **16.358** / 17.371 |
+| (2048, 2048, 8) | **2691.344** / 2738.041 | 39.542 / **35.926** | **4565.182** / 4488.145 | 204.656 / **225.567** | 83.635 / **76.279** |
+| (2048, 1024, 8) | **2679.427** / 2732.789 | 36.255 / **33.036** | **4587.371** / 4496.315 | 226.188 / **248.978** | 39.769 / **36.529** |
+| (2048, 512, 8) | **2672.750** / 2741.562 | 33.042 / **32.869** | **4599.301** / 4480.495 | 255.705 / **257.528** | 19.558 / **19.538** |
+| (1024, 2048, 8) | **1750.457** / 1770.361 | 34.500 / **32.168** | **4681.313** / 4627.371 | 231.971 / **248.800** | 72.373 / **67.619** |
+| (1024, 1024, 8) | **1747.783** / 1771.066 | 30.585 / **29.410** | **4688.487** / 4625.525 | 261.673 / **272.139** | 33.037 / **31.858** |
+| (1024, 512, 8) | **1750.960** / 1785.715 | **26.774** / 27.712 | **4679.955** / 4587.581 | **298.938** / 288.812 | **15.433** / 15.947 |
+| (512, 2048, 8) | **890.936** / 894.174 | 31.853 / **30.421** | **4598.670** / 4580.886 | 251.256 / **263.094** | 66.095 / **63.167** |
+| (512, 1024, 8) | **889.689** / 895.483 | 27.851 / **27.848** | **4605.128** / 4574.192 | 287.371 / **287.408** | **29.382** / 29.385 |
+| (512, 512, 8) | **885.592** / 896.845 | **24.364** / 26.239 | **4626.413** / 4567.243 | **328.516** / 305.032 | **13.336** / 14.305 |
+
+Run status: completed. Recorded GPU 0 cases: 27/27.
+
+Worker results: capacity_limited=13, completed=41.
+
+
+
+## Llama3-8B Base, Offline Synthetic, ISL 512, OSL 4096, optimized DiffKV, Run 20261016-150620-020460
+
+- Started: 2026-10-16T15:06:20+09:00
+- Model: /home/130bb56/DiffKV/.cache/models/Meta-Llama-3-8B
+- GPU: 0
+- DiffKV variant: no-sync-bulk-lengths
+- Physical GPUs: [0]
+- GPU mapping: b8-isl512-osl4096: 0, b4-isl512-osl4096: 0
+- Engine limits: max_model_len=4608, max_num_seqs=8, max_num_batched_tokens=8192
+- ISL: [512], OSL: [4096], B: [8, 4]
+- Measured batches per case: 1
+- Warmup output length: 16
+- Logs: /home/130bb56/DiffKV/logs/performance/long-context-20261016-osl4096-gpu0
+- Command: /home/130bb56/DiffKV/.cache/baselines/fp16-env/bin/python /home/130bb56/DiffKV/benchmarks/run_offline_e2e.py --isls 512 --osls 4096 --batches 8 4 --backends fp16 diffkv --gpu 0 --diffkv-variant no-sync-bulk-lengths --skip-diffkv-on-fp16-oom --repeats 1 --warmup-tokens 16 --output-dir logs/performance/long-context-20261016-osl4096-gpu0 --report evaluation.md
+
+Each cell is **FP16 / DiffKV**. TTFT and TPOT are request means, averaged across measured batches. Among pairs of completed numeric results, lower latency and higher throughput are **bold**; exact ties are both bold.
+
+Prefill Throughput = input tokens / summed prefill engine.step time. Decode Throughput = B * (OSL - 1) / summed decode engine.step time; the first token is generated during prefill. Phase times include scheduling, model execution, sampling and detokenization. E2E Latency measures the complete generation call, including request registration and cleanup, excluding model loading and warmup. OOM means insufficient memory for the requested fixed workload.
+
+| Case (ISL, OSL, B) | TTFT (ms) | TPOT (ms/token) | Prefill Throughput (tok/s) | Decode Throughput (tok/s) | E2E Latency (s) |
+|---|---:|---:|---:|---:|---:|
+| (512, 4096, 8) | **863.421** / 886.640 | **29.538** / 32.555 | **4745.243** / 4619.821 | **270.963** / 245.845 | **121.821** / 134.198 |
+| (512, 4096, 4) | **456.135** / 462.411 | 30.517 / **29.672** | **4491.398** / 4429.332 | 131.118 / **134.852** | 125.424 / **121.971** |
+
+Run status: completed. Recorded cases: 2.
+
+Worker results: completed=4.
+
+FP16, DiffKV 모두 OOM 없이 완료했습니다. 모든 실행에서 요청당 4096토큰, decode 4095회, 고정 batch, preemption 0회를 확인했습니다. FP16 OOM 시 해당 batch의 DiffKV를 건너뛰도록 설정했으며, 실제 skip은 없었습니다. [검증과 조건별 계산](/home/130bb56/DiffKV/logs/performance/long-context-20261016-osl4096-gpu0/analysis.json).
+
+
+## Run 20261016-161730-125499
+
+- Started: 2026-10-16T16:17:30+09:00
+- Model: /home/130bb56/DiffKV/.cache/models/Meta-Llama-3-8B
+- GPU: 0
+- DiffKV variant: no-sync-bulk-lengths
+- Physical GPUs: [0]
+- GPU mapping: b32-isl512-osl512: 0, b16-isl512-osl1024: 0, b8-isl512-osl2048: 0
+- ISL: [512, 1024, 2048], OSL: [512, 1024, 2048], B: [8, 16, 32]
+- Measured batches per case: 1
+- Warmup output length: 16
+- Logs: /home/130bb56/DiffKV/logs/performance/v1-refactor-validation-20261016-161706/offline
+- Command: /home/130bb56/DiffKV/.cache/baselines/fp16-env/bin/python /home/130bb56/DiffKV/benchmarks/run_offline_e2e.py --gpu 0 --diffkv-variant no-sync-bulk-lengths --case-indices 8 16 24 --repeats 1 --warmup-tokens 16 --output-dir /home/130bb56/DiffKV/logs/performance/v1-refactor-validation-20261016-161706/offline --report evaluation.md
+
+Each cell is **FP16 / DiffKV**. TTFT and TPOT are request means, averaged across measured batches. Among pairs of completed numeric results, lower latency and higher throughput are **bold**; exact ties are both bold.
+
+Prefill Throughput = input tokens / summed prefill engine.step time. Decode Throughput = B * (OSL - 1) / summed decode engine.step time; the first token is generated during prefill. Phase times include scheduling, model execution, sampling and detokenization. E2E Latency measures the complete generation call, including request registration and cleanup, excluding model loading and warmup. OOM means insufficient memory for the requested fixed workload.
+
+| Case (ISL, OSL, B) | TTFT (ms) | TPOT (ms/token) | Prefill Throughput (tok/s) | Decode Throughput (tok/s) | E2E Latency (s) |
+|---|---:|---:|---:|---:|---:|
+| (512, 512, 32) | **2516.794** / 2585.833 | **33.046** / 37.946 | **4882.729** / 4751.925 | **1019.955** / 883.215 | **19.405** / 21.977 |
+| (512, 1024, 16) | **1711.645** / 1740.348 | **28.500** / 31.882 | **4787.444** / 4707.206 | **561.776** / 502.153 | **30.868** / 34.356 |
+| (512, 2048, 8) | **885.966** / 894.773 | **30.225** / 30.255 | **4624.412** / 4577.829 | **264.791** / 264.531 | **62.757** / 62.828 |
+
+Run status: completed. Recorded cases: 3.
+
+Worker results: completed=6.
+
+
+### 파일 정리 후 재검증
+
+평가 파일을 5개로 정리한 뒤, 기존 최적화 표에서 FP16과 DiffKV가 모두 완료됐던 3조건을 GPU0에서 각각 1회 재측정했습니다. 위 표가 새 결과이며, 기존 표의 수치는 보존했습니다.
+
+| Case (B, ISL, OSL) | 경로 | 기존 TPOT → 재측정 (ms/token) | 변화 | 기존 E2E → 재측정 (s) | 변화 |
+|---|---|---:|---:|---:|---:|
+| (32, 512, 512) | fp16 | 41.627 → 33.046 | -20.61% | 23.888 → 19.405 | -18.77% |
+| (32, 512, 512) | diffkv | 38.368 → 37.946 | -1.10% | 22.238 → 21.977 | -1.17% |
+| (16, 512, 1024) | fp16 | 34.071 → 28.500 | -16.35% | 36.599 → 30.868 | -15.66% |
+| (16, 512, 1024) | diffkv | 32.555 → 31.882 | -2.07% | 35.055 → 34.356 | -1.99% |
+| (8, 512, 2048) | fp16 | 31.853 → 30.225 | -5.11% | 66.095 → 62.757 | -5.05% |
+| (8, 512, 2048) | diffkv | 30.421 → 30.255 | -0.55% | 63.167 → 62.828 | -0.54% |
+
+- 6개 실행 모두 완료했습니다. GPU UUID, engine 설정, 입력, sampling, 패키지 버전, 고정 decode batch, 생성 길이를 기존 기록과 대조했습니다. Preemption은 모두 0회였습니다.
+- 세 조건에서 FP16과 DiffKV의 출력 SHA256이 같으며, 각각 기존 결과의 출력 SHA256과도 일치했습니다. DiffKV CUDA extension hash도 기존과 같습니다.
+- Correctness: 실제 prompt-cache CUDA 커널 회귀 테스트 3개가 모두 통과했습니다.
+- 코드 이동 전후 v1 적용 함수와 표 작성 함수의 AST가 같고, 기존 결과로 생성한 Markdown도 byte 단위로 같았습니다. 온라인 통합은 프로토콜 24개, MATH 채점 self-test, 모의 HTTP 실행 연결 검사를 통과했습니다.
+- 성능 수치는 기존 기록과 동일하게 재현되지는 않았습니다. 위 변화율은 파일 정리로 얻은 성능 개선으로 해석하지 않습니다. 마지막 DiffKV 측정 중 SW Thermal Slowdown이 Active인 상태를 관찰했으며, 과거의 throttle reason 기록이 없어 수치 차이 전체의 원인을 확정하지 않았습니다.
+- [상세 검증 결과](./logs/performance/v1-refactor-validation-20261016-161706/validation.json)
+- [CUDA correctness 출력](./logs/performance/v1-refactor-validation-20261016-161706/correctness.txt)
+- [측정 중 GPU 상태 관찰](./logs/performance/v1-refactor-validation-20261016-161706/gpu-state-observation.json)
