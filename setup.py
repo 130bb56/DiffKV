@@ -218,6 +218,7 @@ vllm_extension_sources = [
     "csrc/mem_mgt_kernels.cu",
     "csrc/attention/attention_kernels.cu",
     "csrc/attention/sparse_attention_kernels.cu",
+    "csrc/attention/sparse_gqa_attention_kernels.cu",
     "csrc/pos_encoding_kernels.cu",
     "csrc/activation_kernels.cu",
     "csrc/layernorm_kernels.cu",

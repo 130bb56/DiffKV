@@ -1,0 +1,25 @@
+{
+  "case": "b16-isl1024-osl1024",
+  "source": "/home/130bb56/DiffKV/logs/performance/nsys-repeat3-20261018-173725/stats.json",
+  "source_sha256": "8fd72ada2390d47714eef4afdeeccf16a44c27ad42c94dcad2fbbed778d2d68c",
+  "statistic": "mean of per-repetition E2E percentages, n=3",
+  "others": "100 - GEMM - Attention, including all remaining E2E time",
+  "colors": {
+    "GEMM": "#df625c",
+    "Attention": "#5c92c4",
+    "others": "#c4c4c4"
+  },
+  "png_dpi": 600,
+  "series": {
+    "fp16": {
+      "GEMM": 68.14624260662812,
+      "Attention": 16.520611652164447,
+      "others": 15.333145741207431
+    },
+    "diffkv": {
+      "GEMM": 64.46752119085784,
+      "Attention": 22.035590592345418,
+      "others": 13.496888216796748
+    }
+  }
+}

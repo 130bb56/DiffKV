@@ -25,6 +25,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     "sparse_paged_attention",
     &sparse_paged_attention,
     "Compute the attention between an input query and the cached keys/values using class SparsePagedAttention.");
+  ops.def(
+    "sparse_paged_attention_gqa",
+    &sparse_paged_attention_gqa,
+    "Sparse decode attention sharing decoded K/V across four query heads.");
 
   // Activation ops
   ops.def(

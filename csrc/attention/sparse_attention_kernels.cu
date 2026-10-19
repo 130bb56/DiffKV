@@ -39,7 +39,6 @@ namespace cg = cooperative_groups;
 #define WARP_SIZE warpSize
 #endif
 #define NUM_THREADS 256
-
 #define _PARTITION_SIZE 4800
 
 namespace vllm {
@@ -459,7 +458,10 @@ __device__ void sparse_paged_attention_kernel(
   // max qk value for each "warp" (not across the thread block yet).
   // The 0-th thread of each thread group already has its max qk value.
   #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= THREAD_GROUP_SIZE_K; mask /= 2) {
+  // K thread groups are strided across lanes. Their leaders occupy the first
+  // WARP_SIZE / THREAD_GROUP_SIZE_K lanes, so reduce all lanes rather than
+  // assuming leaders are spaced THREAD_GROUP_SIZE_K lanes apart.
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
     qk_max = fmaxf(qk_max, VLLM_SHFL_XOR_SYNC(qk_max, mask));
   }
   if (lane == 0) {
@@ -623,15 +625,14 @@ __device__ void sparse_paged_attention_kernel(
         for (int i = 0; i < V_VEC_SIZE; i++) {
           const int token_idx_within_the_page = vec_idx * V_VEC_SIZE + i;
           const int token_idx = context_block_idx * NUM_TOKENS_PER_PAGE_HIGH + token_idx_within_the_page;
-          // const quant_meta_type meta = v_quant_meta[warp_idx * NUM_TOKENS_PER_PAGE_HIGH + token_idx_within_the_page];
-          const quant_meta_type meta = v_quant_meta[
-            (warp_idx * NUM_TOKENS_PER_PAGE_HIGH + token_idx_within_the_page) * CHUNKS_V_HIGH + value_chunk_idx_high];
-          unpack_and_dequant(v_vec.data[i],
-                             BITS_V_HIGH,
-                             to_float(meta.scale),
-                             to_float(meta.zero_point),
-                             v_floats);
           if (token_idx_within_the_page < NUM_TOKENS_PER_PAGE_HIGH && token_idx < context_len_left) {
+            const quant_meta_type meta = v_quant_meta[
+              (warp_idx * NUM_TOKENS_PER_PAGE_HIGH + token_idx_within_the_page) * CHUNKS_V_HIGH + value_chunk_idx_high];
+            unpack_and_dequant(v_vec.data[i],
+                               BITS_V_HIGH,
+                               to_float(meta.scale),
+                               to_float(meta.zero_point),
+                               v_floats);
             #pragma unroll
             for (int k = 0; k < V_PACK_SIZE_HIGH; k++) {
               accs[p_idx * V_PACK_SIZE_HIGH + k] += logits[token_idx - start_token_idx] * v_floats[k];
@@ -683,15 +684,14 @@ __device__ void sparse_paged_attention_kernel(
         for (int i = 0; i < V_VEC_SIZE; i++) {
           const int token_idx_within_the_page = vec_idx * V_VEC_SIZE + i;
           const int token_idx = context_block_idx * NUM_TOKENS_PER_PAGE_LOW + token_idx_within_the_page;
-          // const quant_meta_type meta = v_quant_meta[warp_idx * NUM_TOKENS_PER_PAGE_LOW + token_idx_within_the_page];
-          const quant_meta_type meta = v_quant_meta[
-            (warp_idx * NUM_TOKENS_PER_PAGE_LOW + token_idx_within_the_page) * CHUNKS_V_LOW + value_chunk_idx_low];
-          unpack_and_dequant(v_vec.data[i],
-                             BITS_V_LOW,
-                             to_float(meta.scale),
-                             to_float(meta.zero_point),
-                             v_floats);
           if (token_idx_within_the_page < NUM_TOKENS_PER_PAGE_LOW && token_idx < context_len_right) {
+            const quant_meta_type meta = v_quant_meta[
+              (warp_idx * NUM_TOKENS_PER_PAGE_LOW + token_idx_within_the_page) * CHUNKS_V_LOW + value_chunk_idx_low];
+            unpack_and_dequant(v_vec.data[i],
+                               BITS_V_LOW,
+                               to_float(meta.scale),
+                               to_float(meta.zero_point),
+                               v_floats);
             #pragma unroll
             for (int k = 0; k < V_PACK_SIZE_LOW; k++) {
               accs[p_idx * V_PACK_SIZE_LOW + k] += logits[token_idx + context_len_left - start_token_idx] * v_floats[k];
@@ -757,7 +757,7 @@ __device__ void sparse_paged_attention_kernel(
   }
 }
 
-// Grid: (num_heads, num_seqs)
+// Grid: (num_kv_heads, num_seqs)
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -791,9 +791,9 @@ __global__ void reduce_kernel(
   const int max_num_blocks_per_seq,
   const int max_num_partitions)
 {
-  const int num_heads = gridDim.x;
-  const int head_idx = blockIdx.x;
-  const int kv_head_idx = head_idx / NUM_QUERIES_PER_KV;
+  const int num_heads = gridDim.x * NUM_QUERIES_PER_KV;
+  const int kv_head_idx = blockIdx.x;
+  const int first_head_idx = kv_head_idx * NUM_QUERIES_PER_KV;
   const int seq_idx = blockIdx.y;
   const int slot_idx = slot_ids[seq_idx];
 
@@ -866,15 +866,19 @@ __global__ void reduce_kernel(
 
   if (!USE_PARTITIONING) {
     // No need to reduce. Only copy tmp_out to out.
-    scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-    const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
-                                          + head_idx * max_num_partitions * HEAD_SIZE;
-    for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
-      out_ptr[i] = tmp_out_ptr[i];
+    for (int query_idx = 0; query_idx < NUM_QUERIES_PER_KV; ++query_idx) {
+      const int head_idx = first_head_idx + query_idx;
+      scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+      const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
+                                            + head_idx * max_num_partitions * HEAD_SIZE;
+      for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
+        out_ptr[i] = tmp_out_ptr[i];
+      }
     }
 
-    // The first head in NUM_QUERIES_PER_KV heads computes the max score and updates the score cache.
-    if (head_idx % NUM_QUERIES_PER_KV == 0) {
+    // One CTA owns all query heads sharing this KV head. The main kernel has
+    // already completed every normalized score write before this launch.
+    {
       for (int token_idx = threadIdx.x; token_idx < context_len; token_idx += NUM_THREADS) {
         float score = 0.0f;
         #pragma unroll
@@ -914,74 +918,84 @@ __global__ void reduce_kernel(
   // Workspace for reduction.
   __shared__ float red_smem[2 * NUM_WARPS];
 
-  // Load max logits to shared memory.
-  float* shared_max_logits = reinterpret_cast<float*>(shared_mem);
-  const float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
-                                           + head_idx * max_num_partitions;
-  float max_logit = -FLT_MAX;
-  for (int i = threadIdx.x; i < num_partitions; i += NUM_THREADS) {
-    const float l = max_logits_ptr[i];
-    shared_max_logits[i] = l;
-    max_logit = fmaxf(max_logit, l);
-  }
-  __syncthreads();
+  // Keep all query heads of a KV head in one CTA. A block-wide barrier after
+  // each query's rescale makes every score visible before the grouped maximum.
+  for (int query_idx = 0; query_idx < NUM_QUERIES_PER_KV; ++query_idx) {
+    const int head_idx = first_head_idx + query_idx;
 
-  // Get the global max logit.
-  // Reduce within the warp.
-  #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
-  }
-  if (lane == 0) {
-    red_smem[warp_idx] = max_logit;
-  }
-  __syncthreads();
-  // Reduce across warps.
-  max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
-  #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
-    max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
-  }
-  // Broadcast the max value to all threads.
-  max_logit = VLLM_SHFL_SYNC(max_logit, 0);
-
-  // Load rescale factors to shared memory.
-  float* rescale_factors = reinterpret_cast<float*>(shared_mem + sizeof(float) * num_partitions);
-  const float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
-                                       + head_idx * max_num_partitions;
-  float global_exp_sum = 0.0f;
-  for (int i = threadIdx.x; i < num_partitions; i += NUM_THREADS) {
-    float l = shared_max_logits[i];
-    global_exp_sum += exp_sums_ptr[i] * expf(l - max_logit);
-    rescale_factors[i] = (exp_sums_ptr[i] + 1e-6) * expf(l - max_logit);
-  }
-  __syncthreads();
-  global_exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], global_exp_sum);
-  const float inv_global_exp_sum = __fdividef(1.0f, global_exp_sum + 1e-6f);
-
-  // Aggregate tmp_out to out.
-  const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
-                                        + head_idx * max_num_partitions * HEAD_SIZE;
-  scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-  #pragma unroll
-  for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
-    float acc = 0.0f;
-    for (int j = 0; j < num_partitions; ++j) {
-      acc += to_float(tmp_out_ptr[j * HEAD_SIZE + i]) * rescale_factors[j] * inv_global_exp_sum;
+    // Load max logits to shared memory.
+    float* shared_max_logits = reinterpret_cast<float*>(shared_mem);
+    const float* max_logits_ptr = max_logits + seq_idx * num_heads * max_num_partitions
+                                             + head_idx * max_num_partitions;
+    float max_logit = -FLT_MAX;
+    for (int i = threadIdx.x; i < num_partitions; i += NUM_THREADS) {
+      const float l = max_logits_ptr[i];
+      shared_max_logits[i] = l;
+      max_logit = fmaxf(max_logit, l);
     }
-    from_float(out_ptr[i], acc);
+    __syncthreads();
+
+    // Get the global max logit.
+    // Reduce within the warp.
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+      max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+    }
+    if (lane == 0) {
+      red_smem[warp_idx] = max_logit;
+    }
+    __syncthreads();
+    // Reduce across warps.
+    max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+    #pragma unroll
+    for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+      max_logit = fmaxf(max_logit, VLLM_SHFL_XOR_SYNC(max_logit, mask));
+    }
+    // Broadcast the max value to all threads.
+    max_logit = VLLM_SHFL_SYNC(max_logit, 0);
+
+    // Load rescale factors to shared memory.
+    float* rescale_factors = reinterpret_cast<float*>(shared_mem + sizeof(float) * num_partitions);
+    const float* exp_sums_ptr = exp_sums + seq_idx * num_heads * max_num_partitions
+                                         + head_idx * max_num_partitions;
+    float global_exp_sum = 0.0f;
+    for (int i = threadIdx.x; i < num_partitions; i += NUM_THREADS) {
+      float l = shared_max_logits[i];
+      global_exp_sum += exp_sums_ptr[i] * expf(l - max_logit);
+      rescale_factors[i] = (exp_sums_ptr[i] + 1e-6) * expf(l - max_logit);
+    }
+    __syncthreads();
+    global_exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], global_exp_sum);
+    const float inv_global_exp_sum = __fdividef(1.0f, global_exp_sum + 1e-6f);
+
+    // Aggregate tmp_out to out.
+    const scalar_t* tmp_out_ptr = tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
+                                          + head_idx * max_num_partitions * HEAD_SIZE;
+    scalar_t* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+    #pragma unroll
+    for (int i = threadIdx.x; i < HEAD_SIZE; i += NUM_THREADS) {
+      float acc = 0.0f;
+      for (int j = 0; j < num_partitions; ++j) {
+        acc += to_float(tmp_out_ptr[j * HEAD_SIZE + i]) * rescale_factors[j] * inv_global_exp_sum;
+      }
+      from_float(out_ptr[i], acc);
+    }
+
+    // Rescale tmp_scores
+    float* tmp_scores_ptr = tmp_scores + seq_idx * num_heads * max_context_len + head_idx * max_context_len;
+    #pragma unroll
+    for (int token_idx = threadIdx.x; token_idx < context_len; token_idx += NUM_THREADS) {
+      const int partition_idx = token_idx < context_len_left
+        ? token_idx / PARTITION_SIZE
+        : DIVIDE_ROUND_UP(context_len_left, PARTITION_SIZE)
+            + (token_idx - context_len_left) / PARTITION_SIZE;
+      tmp_scores_ptr[token_idx] *= rescale_factors[partition_idx] * inv_global_exp_sum;
+    }
+    __syncthreads();
   }
 
-  // Rescale tmp_scores
-  float* tmp_scores_ptr = tmp_scores + seq_idx * num_heads * max_context_len + head_idx * max_context_len;
-  #pragma unroll
-  for (int token_idx = threadIdx.x; token_idx < context_len; token_idx += NUM_THREADS) {
-    int partition_idx = token_idx / PARTITION_SIZE;
-    tmp_scores_ptr[token_idx] *= rescale_factors[partition_idx] * inv_global_exp_sum;
-  }
-
-  // The first head in NUM_QUERIES_PER_KV heads computes the max score and updates the score cache.
-  if (head_idx % NUM_QUERIES_PER_KV == 0) {
+  // Every query head's scores were normalized by this CTA above.
+  {
     for (int token_idx = threadIdx.x; token_idx < context_len; token_idx += NUM_THREADS) {
       float score = 0.0f;
       #pragma unroll
@@ -1009,27 +1023,6 @@ __global__ void reduce_kernel(
       *reinterpret_cast<float*>(&kv_cache[score_offset]) += score;
     }
   }
-
-  // // if NUM_QUERIES_PER_KV = 1, directly write the softmax logits to score cache.
-  // for (int token_idx = threadIdx.x; token_idx < context_len; token_idx += NUM_THREADS) {
-  //   float score = logits[token_idx];
-  //   int64_t score_offset;
-  //   if (token_idx < context_len_left) {
-  //     // Access block table from left
-  //     int64_t physical_block_number = static_cast<int64_t>(*(block_table_left +
-  //       (token_idx / NUM_TOKENS_PER_PAGE_HIGH)));
-  //     score_offset = physical_block_number * unified_page_size + SCORE_BASE_HIGH
-  //                   + token_idx % NUM_TOKENS_PER_PAGE_HIGH * 2;
-  //   } else {
-  //     // Access block table from right
-  //     int64_t physical_block_number = static_cast<int64_t>(*(block_table_right -
-  //       (token_idx - context_len_left) / NUM_TOKENS_PER_PAGE_LOW));
-  //     score_offset = physical_block_number * unified_page_size + SCORE_BASE_LOW
-  //                   + (token_idx - context_len_left) % NUM_TOKENS_PER_PAGE_LOW * 2;
-  //   }
-
-  //   *reinterpret_cast<float*>(&kv_cache[score_offset]) += score;
-  // }
 
 }
 
@@ -1171,6 +1164,16 @@ void sparse_paged_attention_launcher(
   const c10::optional<torch::Tensor>& alibi_slopes)
 {
   // printf("[Debug info from sparse_attention_kernels.cu] max_context_len: %d\n", max_context_len);
+  TORCH_CHECK(query.dim() == 3 && query.stride(2) == 1 &&
+              query.stride(1) == query.size(2),
+              "Attention queries must have contiguous head dimensions");
+  TORCH_CHECK(block_tables.dim() == 4 && kv_len_tables.dim() == 4 && kv_cache.dim() == 2,
+              "Unexpected attention cache metadata dimensions");
+  TORCH_CHECK(out.is_contiguous() && exp_sums.is_contiguous() && max_logits.is_contiguous() &&
+              tmp_out.is_contiguous() && tmp_scores.is_contiguous() && kv_cache.is_contiguous() &&
+              block_tables.is_contiguous() && kv_len_tables.is_contiguous() &&
+              slot_ids.is_contiguous() && positions.is_contiguous(),
+              "Attention output, workspace and cache tensors must be contiguous");
   const int num_seqs = query.size(0);
   const int num_heads = query.size(1);
   const int head_size = query.size(2);
@@ -1183,7 +1186,9 @@ void sparse_paged_attention_launcher(
   assert(head_size % WARP_SIZE == 0);
   assert(WARP_SIZE % THREAD_GROUP_SIZE_K == 0);
 
-  assert(num_heads % num_kv_heads == 0);
+  TORCH_CHECK(num_seqs > 0 && num_kv_heads > 0 && num_heads > 0 &&
+              num_heads % num_kv_heads == 0,
+              "Attention requires nonempty queries with an integral query/KV head ratio");
   const int num_queries_per_kv = num_heads / num_kv_heads;
 
   // NOTE: alibi_slopes is optional.
@@ -1208,11 +1213,26 @@ void sparse_paged_attention_launcher(
 
   // Make PARTITION_SIZE a multiple of the page size.
   constexpr int PARTITION_SIZE = DIVIDE_ROUND_UP(_PARTITION_SIZE, (NUM_TOKENS_PER_PAGE_HIGH * NUM_TOKENS_PER_PAGE_LOW))
-                                 * (NUM_TOKENS_PER_PAGE_HIGH * NUM_TOKENS_PER_PAGE_LOW);
+      * (NUM_TOKENS_PER_PAGE_HIGH * NUM_TOKENS_PER_PAGE_LOW);
+  static_assert(PARTITION_SIZE % NUM_TOKENS_PER_PAGE_HIGH == 0,
+                "Partition size must be a multiple of the high-precision page size");
+  static_assert(PARTITION_SIZE % NUM_TOKENS_PER_PAGE_LOW == 0,
+                "Partition size must be a multiple of the low-precision page size");
   int max_num_partitions = 1;  // no partitioning by default
   if (max_context_len > PARTITION_SIZE) {
     max_num_partitions = DIVIDE_ROUND_UP(max_context_len, PARTITION_SIZE) + 1;
   }
+  const int64_t num_query_heads = static_cast<int64_t>(num_seqs) * num_heads;
+  TORCH_CHECK(max_context_len > 0, "max_context_len must be positive");
+  TORCH_CHECK(out.numel() >= num_query_heads * head_size,
+              "Attention output buffer is too small");
+  TORCH_CHECK(tmp_scores.numel() >= num_query_heads * max_context_len,
+              "Attention score buffer is too small for max_context_len");
+  TORCH_CHECK(tmp_out.numel() >= num_query_heads * max_num_partitions * head_size,
+              "Attention temporary output buffer is too small for ", max_num_partitions, " partitions");
+  TORCH_CHECK(exp_sums.numel() >= num_query_heads * max_num_partitions &&
+              max_logits.numel() >= num_query_heads * max_num_partitions,
+              "Attention normalization buffers are too small for ", max_num_partitions, " partitions");
 
   // Reserve enough (a bit more) shared memory space for logits.
   int logits_size = (PARTITION_SIZE + MAX(NUM_TOKENS_PER_PAGE_HIGH, NUM_TOKENS_PER_PAGE_LOW)
@@ -1232,7 +1252,7 @@ void sparse_paged_attention_launcher(
   dim3 grid(num_heads, num_seqs, max_num_partitions);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  dim3 reduce_grid(num_heads, num_seqs);
+  dim3 reduce_grid(num_kv_heads, num_seqs);
   int reduce_shared_mem_size = 2 * max_num_partitions * sizeof(float);
 
   // Dispatch the kernel based on the head size and the number of queries per kv.
@@ -1427,6 +1447,48 @@ void sparse_paged_attention(
     CALL_LAUNCHER_QUANT_CONFIG(__nv_bfloat16);
   } else {
     TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+  }
+}
+
+// Share the corrected grouped-score reduction with the K/V-reuse main kernel.
+void sparse_paged_attention_gqa_reduce(
+  torch::Tensor& out,
+  torch::Tensor& exp_sums,
+  torch::Tensor& max_logits,
+  torch::Tensor& tmp_out,
+  torch::Tensor& tmp_scores,
+  torch::Tensor& slot_ids,
+  torch::Tensor& block_tables,
+  torch::Tensor& kv_len_tables,
+  torch::Tensor& kv_cache,
+  int layer_idx,
+  int num_kv_heads,
+  int max_context_len) {
+  constexpr int PARTITION_SIZE = 5760;
+  const int max_num_partitions = max_context_len <= PARTITION_SIZE
+    ? 1 : DIVIDE_ROUND_UP(max_context_len, PARTITION_SIZE) + 1;
+  const dim3 grid(num_kv_heads, out.size(0));
+  const dim3 block(NUM_THREADS);
+  const int shared_bytes = 2 * max_num_partitions * sizeof(float);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const auto launch = [&](auto scalar_type) {
+    using T = decltype(scalar_type);
+    vllm::reduce_kernel<T, 128, 4, 8, 4, 4, 2, 1, 1, 1, 1, 32, 60, PARTITION_SIZE>
+      <<<grid, block, shared_bytes, stream>>>(
+        reinterpret_cast<T*>(out.data_ptr()),
+        exp_sums.data_ptr<float>(), max_logits.data_ptr<float>(),
+        reinterpret_cast<T*>(tmp_out.data_ptr()), tmp_scores.data_ptr<float>(),
+        block_tables.data_ptr<int>(), kv_len_tables.data_ptr<int>(),
+        slot_ids.data_ptr<int>(), reinterpret_cast<uint16_t*>(kv_cache.data_ptr()),
+        kv_cache.size(1), layer_idx, block_tables.size(1), num_kv_heads,
+        max_context_len, block_tables.size(3), max_num_partitions);
+  };
+  if (out.scalar_type() == at::ScalarType::Half) {
+    launch(uint16_t{});
+  } else if (out.scalar_type() == at::ScalarType::BFloat16) {
+    launch(__nv_bfloat16{});
+  } else {
+    TORCH_CHECK(false, "Unsupported GQA output data type: ", out.dtype());
   }
 }
 

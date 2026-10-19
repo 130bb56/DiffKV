@@ -60,6 +60,8 @@ class SparsePagedAttention(nn.Module):
         self.head_size = head_size
         self.scale = float(scale)
         self.kv_buffer_size = kv_buffer_size    # size of local kv buffer
+        # Selected before warmup by the GQA-reuse benchmark variant.
+        self.use_gqa_reuse = False
 
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
@@ -416,7 +418,9 @@ class SparsePagedAttention(nn.Module):
             max_logits = torch.empty_like(exp_sums)
 
             # TODO(@yanqi): Pass the following parameters from the framework. Now they are hardcoded.
-            ops.sparse_paged_attention(
+            attention_op = (ops.sparse_paged_attention_gqa if self.use_gqa_reuse
+                            else ops.sparse_paged_attention)
+            attention_op(
                 slot_ids,
                 input_positions,
                 output,

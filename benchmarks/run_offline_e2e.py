@@ -589,7 +589,10 @@ def worker(args, case, source, prompts_by_length):
         engine = llm.llm_engine
         w = get_worker(engine, backend)
         if backend == "diffkv" and variant != "original":
-            from diffkv_v1 import apply_variant
+            if variant.startswith("gqa-"):
+                from diffkv_gqa import apply_variant
+            else:
+                from diffkv_v1 import apply_variant
             result["python_variant"] = apply_variant(
                 engine, w, variant, args.output_dir / f"{case['id']}-diffkv.ablation")
             result["measurement"]["diffkv_variant"] = variant
@@ -735,8 +738,10 @@ def main():
     parser.add_argument("--osls", type=int, nargs="+", choices=[*LENGTHS, 4096], default=LENGTHS)
     parser.add_argument("--batches", type=int, nargs="+", choices=[4, *BATCHES], default=BATCHES)
     parser.add_argument("--backends", nargs="+", choices=("fp16", "diffkv"), default=["fp16", "diffkv"])
-    parser.add_argument("--diffkv-variant", choices=("original", "no-sync", "no-sync-bulk-lengths"),
-                        default="original", help="Process-local DiffKV Python execution variant")
+    parser.add_argument("--diffkv-variant",
+                        choices=("original", "no-sync", "no-sync-bulk-lengths",
+                                 "gqa-reference", "gqa-reuse"),
+                        default="original", help="DiffKV execution variant; GQA reuse requires a rebuilt CUDA extension")
     parser.add_argument("--skip-diffkv-on-fp16-oom", action="store_true",
                         help="Skip the paired DiffKV worker if FP16 cannot fit the fixed workload")
     parser.add_argument("--case-indices", type=int, nargs="+",
