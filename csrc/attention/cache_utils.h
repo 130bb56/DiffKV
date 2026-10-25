@@ -7,11 +7,13 @@
 #define LOG2_V_VEC_SIZE 1
 #define THREAD_GROUP_SIZE_K 4
 
-struct k_vec_type {
+// Each key vector occupies one naturally aligned 64-bit cache payload load.
+struct alignas(K_VEC_SIZE * sizeof(uint16_t)) k_vec_type {
   uint16_t data[K_VEC_SIZE];
 };
 
-struct v_vec_type {
+// Two adjacent token payloads share one naturally aligned 32-bit load.
+struct alignas(V_VEC_SIZE * sizeof(uint16_t)) v_vec_type {
   uint16_t data[V_VEC_SIZE];
 };
 

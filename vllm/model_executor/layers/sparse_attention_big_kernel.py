@@ -19,6 +19,8 @@ import time
 _SUPPORTED_HEAD_SIZES = [16, 64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in the attention kernel
 _PARTITION_SIZE = 4800
+# Must match the specialized GQA main and reduction kernels.
+_GQA_PARTITION_SIZE = 240
 _PARTITION_SIZE_PROMPT = 4000
 # _PARTITION_SIZE_PROMPT = 8
 
@@ -60,8 +62,8 @@ class SparsePagedAttention(nn.Module):
         self.head_size = head_size
         self.scale = float(scale)
         self.kv_buffer_size = kv_buffer_size    # size of local kv buffer
-        # Selected before warmup by the GQA-reuse benchmark variant.
-        self.use_gqa_reuse = False
+        # Allow the GQA kernel only for supported decode configurations.
+        self.use_gqa_reuse = True
 
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
@@ -396,15 +398,36 @@ class SparsePagedAttention(nn.Module):
 
             # a new token might be appended in this forward pass
             max_context_len += 1
+            use_gqa_reuse = (
+                self.use_gqa_reuse
+                and query.dtype == torch.float16
+                and self.head_size == 128
+                and self.num_queries_per_kv == 4
+                and (input_metadata.num_bits_k_high,
+                     input_metadata.num_bits_v_high,
+                     input_metadata.num_bits_k_low,
+                     input_metadata.num_bits_v_low,
+                     input_metadata.num_chunks_k_high,
+                     input_metadata.num_chunks_v_high,
+                     input_metadata.num_chunks_k_low,
+                     input_metadata.num_chunks_v_low) == (8, 4, 4, 2, 1, 1, 1, 1)
+                and (input_metadata.key_vec_size,
+                     input_metadata.val_vec_size) == (4, 2)
+                and (input_metadata.num_tokens_per_block_high,
+                     input_metadata.num_tokens_per_block_low) == (32, 60)
+                and query.stride(1) == 128
+                and query.stride(2) == 1
+            )
+            partition_size = _GQA_PARTITION_SIZE if use_gqa_reuse else _PARTITION_SIZE
             # tmp_scores is a buffer to store the attention scores for each kv head
             # TODO: we should optimize this
             tmp_scores = torch.empty((batch_size, self.num_heads, max_context_len),
                                       dtype=torch.float32, device=query.device)
 
-            if max_context_len <= _PARTITION_SIZE:
+            if max_context_len <= partition_size:
                 num_partitions = 1
             else:
-                num_partitions = ((max_context_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE) + 1
+                num_partitions = ((max_context_len + partition_size - 1) // partition_size) + 1
             tmp_output = torch.empty(
                 size=(batch_size, self.num_heads, num_partitions, self.head_size),
                 dtype=output.dtype,
@@ -418,7 +441,7 @@ class SparsePagedAttention(nn.Module):
             max_logits = torch.empty_like(exp_sums)
 
             # TODO(@yanqi): Pass the following parameters from the framework. Now they are hardcoded.
-            attention_op = (ops.sparse_paged_attention_gqa if self.use_gqa_reuse
+            attention_op = (ops.sparse_paged_attention_gqa if use_gqa_reuse
                             else ops.sparse_paged_attention)
             attention_op(
                 slot_ids,
