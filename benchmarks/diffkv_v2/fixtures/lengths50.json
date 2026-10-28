@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "source_sha256": "ce2f948812e389501c69e2a317e3d248234ce4dfeff023d825d76f6baa70c168",
+  "metadata": {
+    "backend": "fp16",
+    "mode": "natural",
+    "workload_sha256": "1d7100b226f4c7df612f94d693030715c94f02a87f0f3f769814027901f1c75e",
+    "derived_from": "/home/130bb56/DiffKV/evaluation-logs/r1-math50-20261023/diffkv-v2-temp-20261024/fp16-natural.json",
+    "derived_from_sha256": "956c16f79758f17e7b3b02a4c9f93af3dae2142496f464c98a1d9ff068e55bca",
+    "note": "Per-request output lengths of the FP16 EOS-terminated run at 1395 MHz (temperature 0.6, seed 42). workload_sha256 is set to workload-greedy.json (same prompts and engine settings, generation temperature 0) so that run_r1_math.py accepts it as the length reference for all backends.",
+    "request_signature": "1aa6343c3196d9bdeaafc2e7b138fb5e4cac3ede5cf2171f40677200cacba909"
+  },
+  "requests": [
+    {
+      "request_id": "math500-327",
+      "output_tokens": 4876
+    },
+    {
+      "request_id": "math500-057",
+      "output_tokens": 3925
+    },
+    {
+      "request_id": "math500-012",
+      "output_tokens": 2941
+    },
+    {
+      "request_id": "math500-379",
+      "output_tokens": 3527
+    },
+    {
+      "request_id": "math500-140",
+      "output_tokens": 1685
+    },
+    {
+      "request_id": "math500-125",
+      "output_tokens": 2140
+    },
+    {
+      "request_id": "math500-114",
+      "output_tokens": 2432
+    },
+    {
+      "request_id": "math500-071",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-377",
+      "output_tokens": 1960
+    },
+    {
+      "request_id": "math500-052",
+      "output_tokens": 2344
+    },
+    {
+      "request_id": "math500-346",
+      "output_tokens": 1803
+    },
+    {
+      "request_id": "math500-456",
+      "output_tokens": 3040
+    },
+    {
+      "request_id": "math500-279",
+      "output_tokens": 3991
+    },
+    {
+      "request_id": "math500-044",
+      "output_tokens": 1026
+    },
+    {
+      "request_id": "math500-302",
+      "output_tokens": 4811
+    },
+    {
+      "request_id": "math500-216",
+      "output_tokens": 2275
+    },
+    {
+      "request_id": "math500-016",
+      "output_tokens": 3707
+    },
+    {
+      "request_id": "math500-015",
+      "output_tokens": 4552
+    },
+    {
+      "request_id": "math500-047",
+      "output_tokens": 934
+    },
+    {
+      "request_id": "math500-111",
+      "output_tokens": 1191
+    },
+    {
+      "request_id": "math500-119",
+      "output_tokens": 7605
+    },
+    {
+      "request_id": "math500-258",
+      "output_tokens": 1404
+    },
+    {
+      "request_id": "math500-308",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-013",
+      "output_tokens": 987
+    },
+    {
+      "request_id": "math500-287",
+      "output_tokens": 3816
+    },
+    {
+      "request_id": "math500-101",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-366",
+      "output_tokens": 3035
+    },
+    {
+      "request_id": "math500-332",
+      "output_tokens": 3186
+    },
+    {
+      "request_id": "math500-359",
+      "output_tokens": 1743
+    },
+    {
+      "request_id": "math500-214",
+      "output_tokens": 1782
+    },
+    {
+      "request_id": "math500-112",
+      "output_tokens": 4267
+    },
+    {
+      "request_id": "math500-229",
+      "output_tokens": 1005
+    },
+    {
+      "request_id": "math500-301",
+      "output_tokens": 5005
+    },
+    {
+      "request_id": "math500-142",
+      "output_tokens": 2196
+    },
+    {
+      "request_id": "math500-414",
+      "output_tokens": 1365
+    },
+    {
+      "request_id": "math500-445",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-003",
+      "output_tokens": 2209
+    },
+    {
+      "request_id": "math500-388",
+      "output_tokens": 1328
+    },
+    {
+      "request_id": "math500-412",
+      "output_tokens": 3208
+    },
+    {
+      "request_id": "math500-081",
+      "output_tokens": 1461
+    },
+    {
+      "request_id": "math500-357",
+      "output_tokens": 3019
+    },
+    {
+      "request_id": "math500-174",
+      "output_tokens": 2232
+    },
+    {
+      "request_id": "math500-079",
+      "output_tokens": 1813
+    },
+    {
+      "request_id": "math500-110",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-490",
+      "output_tokens": 8192
+    },
+    {
+      "request_id": "math500-390",
+      "output_tokens": 4169
+    },
+    {
+      "request_id": "math500-172",
+      "output_tokens": 1329
+    },
+    {
+      "request_id": "math500-194",
+      "output_tokens": 7054
+    },
+    {
+      "request_id": "math500-049",
+      "output_tokens": 1073
+    },
+    {
+      "request_id": "math500-183",
+      "output_tokens": 5452
+    }
+  ]
+}

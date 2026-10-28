@@ -208,6 +208,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
+        self.diffkv_state = None
+        if getattr(vllm_config.attention_config.backend, "name", None) == "DIFFKV_V2":
+            from vllm.diffkv_v2.runner import DiffKVRunnerState
+
+            self.diffkv_state = DiffKVRunnerState(vllm_config)
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -791,6 +796,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        if self.diffkv_state is not None:
+            self.diffkv_state.initialize(kv_caches_dict)
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -989,6 +996,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self, randomize_inputs: bool = False) -> None:
+        diffkv_workspace = (
+            self.diffkv_state.profile_workspace(self.device)
+            if self.diffkv_state is not None
+            else None
+        )
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -1016,7 +1028,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_pooler_run(hidden_states)
 
         torch.accelerator.synchronize()
-        del hidden_states, sample_hidden_states
+        del hidden_states, sample_hidden_states, diffkv_workspace
         self.reset_encoder_cache()
         gc.collect()
 
@@ -1132,6 +1144,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
+        if self.diffkv_state is not None:
+            self.diffkv_state.remove_request(req_id)
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
@@ -1150,6 +1164,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if self.diffkv_state is not None:
+            self.diffkv_state.preempt_requests(scheduler_output)
         finished_req_ids = scheduler_output.finished_req_ids
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
@@ -1189,6 +1205,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
+            if self.diffkv_state is not None:
+                self.diffkv_state.add_request(new_req_data)
             sampling_params = new_req_data.sampling_params
             self.req_states.add_request(
                 req_id=req_id,
@@ -1743,6 +1761,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                if self.diffkv_state is not None:
+                    empty_output = self.diffkv_state.attach_report(
+                        empty_output, refresh=True
+                    )
                 return self._merge_ec_connector_no_forward(
                     scheduler_output, empty_output
                 )
@@ -1882,6 +1904,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_interleave,
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
+
+        if self.diffkv_state is not None:
+            self.diffkv_state.prepare_batch(input_batch, dummy_run)
 
         attn_metadata = None
         slot_mappings_by_layer = None
@@ -2044,6 +2069,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if self.diffkv_state is not None:
+            self.diffkv_state.finish_batch(dummy_run)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2176,6 +2203,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             cudagraph_stats=cudagraph_stats,
         )
+        if self.diffkv_state is not None:
+            model_runner_output = self.diffkv_state.attach_report(model_runner_output)
         pending_aux_output = None
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)

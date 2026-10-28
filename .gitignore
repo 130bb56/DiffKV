@@ -232,6 +232,8 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+!benchmarks/diffkv_v2/fixtures/math50.json
+!benchmarks/diffkv_v2/fixtures/lengths50.json
 
 # Linting
 actionlint

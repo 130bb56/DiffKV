@@ -701,6 +701,10 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
+        if getattr(self.attention_config.backend, "name", None) == "DIFFKV_V2":
+            if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+                raise ValueError("DIFFKV_V2 requires Model Runner V2")
+            return True
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:
                 raise ValueError(

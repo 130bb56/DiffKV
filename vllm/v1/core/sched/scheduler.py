@@ -325,7 +325,22 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
-        self.kv_cache_manager = KVCacheManager(
+        from vllm.diffkv_v2.scheduler import DiffKVKVCacheManager, uses_diffkv
+
+        self.diffkv_cache = uses_diffkv(kv_cache_config)
+        if self.diffkv_cache and (
+            self.scheduler_config.async_scheduling
+            or self.connector is not None
+            or self.vllm_config.speculative_config is not None
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise ValueError(
+                "DiffKV-v2 requires synchronous TP=1, PP=1 scheduling without "
+                "speculative decoding or KV connectors"
+            )
+        manager_class = DiffKVKVCacheManager if self.diffkv_cache else KVCacheManager
+        self.kv_cache_manager = manager_class(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
@@ -343,6 +358,11 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+        )
+        self.diffkv_physical_manager = (
+            self.kv_cache_manager
+            if isinstance(self.kv_cache_manager, DiffKVKVCacheManager)
+            else None
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -1584,6 +1604,8 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.diffkv_physical_manager is not None:
+            self.diffkv_physical_manager.preempt_physical(request.request_id)
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)
@@ -2028,6 +2050,10 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self.diffkv_physical_manager is not None:
+            self.diffkv_physical_manager.update_physical_report(
+                model_runner_output.diffkv_cache_report
+            )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
