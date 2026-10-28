@@ -24,6 +24,7 @@ LAYER_IDX = 1
 SCALE = HEAD_SIZE**-0.5
 QUANT_ARGS = (8, 4, 4, 2, 1, 1, 1, 1, 4, 2, 32, 60)
 PARTITION_SIZE = 5760
+GQA_PARTITION_SIZE = 240
 MODES = ("legacy", "gqa")
 
 
@@ -202,10 +203,11 @@ def device_inputs(fixture, device="cuda"):
     return result
 
 
-def allocate_workspaces(fixture, device="cuda"):
+def allocate_workspaces(fixture, device="cuda", partition_size=None):
     seqs, heads, size = fixture.query.shape
-    capacity = (1 if fixture.max_context_len <= PARTITION_SIZE else
-                (fixture.max_context_len + PARTITION_SIZE - 1) // PARTITION_SIZE + 1)
+    partition_size = PARTITION_SIZE if partition_size is None else partition_size
+    capacity = (1 if fixture.max_context_len <= partition_size else
+                (fixture.max_context_len + partition_size - 1) // partition_size + 1)
     return dict(
         out=torch.empty((seqs, heads, size), dtype=torch.float16, device=device),
         exp_sums=torch.full((seqs, heads, capacity), float("nan"), device=device),
@@ -298,7 +300,8 @@ class DecodeAttentionCorrectness(unittest.TestCase):
         for mode in MODES:
             with self.subTest(lengths=lengths, mode=mode):
                 inputs = device_inputs(fixture)
-                workspace = allocate_workspaces(fixture)
+                workspace = allocate_workspaces(
+                    fixture, partition_size=GQA_PARTITION_SIZE if mode == "gqa" else 5760)
                 args = attention_args(fixture, inputs, workspace)
                 op = (self.ops.sparse_paged_attention if mode == "legacy" else
                       self.ops.sparse_paged_attention_gqa)
@@ -329,6 +332,20 @@ class DecodeAttentionCorrectness(unittest.TestCase):
     def test_medium_mixed_context(self):
         self.check_case(((479, 480), (959, 960)))
 
+    def test_around_240_tokens(self):
+        self.check_case(((119, 120), (120, 120), (121, 120)))
+
+    def test_high_and_low_240_partition_edges(self):
+        # P240 splits a 32-token high page, and each precision region rounds
+        # its partition count independently.
+        self.check_case(((239, 1), (240, 1), (241, 1),
+                         (33, 239), (33, 240), (33, 241)))
+
+    def test_more_than_32_gqa_partitions(self):
+        # Eighteen high plus eighteen low partitions exercise the reduction
+        # beyond a single warp's 32 lanes.
+        self.check_case(((4096, 4096),))
+
     def test_around_5760_tokens(self):
         self.check_case(((2879, 2880), (2880, 2880), (2881, 2880)))
 
@@ -352,7 +369,7 @@ class DecodeAttentionCorrectness(unittest.TestCase):
     def test_unsupported_gqa_ratio_is_rejected(self):
         fixture = build_fixture()
         inputs = device_inputs(fixture)
-        workspace = allocate_workspaces(fixture)
+        workspace = allocate_workspaces(fixture, partition_size=GQA_PARTITION_SIZE)
         # Two query heads per KV head are valid attention inputs, but this
         # shared-K/V specialization deliberately supports exactly four.
         inputs["query"] = inputs["query"][:, ::2].contiguous()

@@ -2,7 +2,7 @@
 
 Example, after building the extension with the grouped-query entry point::
 
-    CUDA_VISIBLE_DEVICES=0 .cache/baselines/fp16-env/bin/python \
+    CUDA_VISIBLE_DEVICES=1 .cache/baselines/fp16-env/bin/python \
         benchmarks/benchmark_diffkv_gqa.py --output /tmp/diffkv-gqa.json
 
 This measures one attention layer, not model throughput. Packed mixed-precision
@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = ROOT / "tests/kernels/test_diffkv_decode_attention.py"
 VARIANTS = ("reference", "gqa-reuse")
 PARTITION_SIZE = 5760
+GQA_PARTITION_SIZE = 240
 
 
 def sha256(path):
@@ -99,7 +100,10 @@ def mixed_lengths(context, batch):
 
 def make_runner(torch, ops, reference, fixture, variant):
     device_fields = reference.device_inputs(fixture)
-    workspace = reference.allocate_workspaces(fixture)
+    partition_size = (PARTITION_SIZE if variant == "reference" else
+                      GQA_PARTITION_SIZE)
+    workspace = reference.allocate_workspaces(fixture,
+                                             partition_size=partition_size)
     partitions = workspace["exp_sums"].shape[2]
     arguments = reference.attention_args(fixture, device_fields, workspace)
     operation = (ops.sparse_paged_attention if variant == "reference"
@@ -117,6 +121,7 @@ def make_runner(torch, ops, reference, fixture, variant):
 
     return {"run": run, "reset": reset, "output": workspace["out"],
             "cache": device_fields["kv_cache"], "partitions": partitions,
+            "partition_size": partition_size,
             "workspace_bytes": sum(t.numel() * t.element_size() for t in
                                    workspace.values())}
 
@@ -216,7 +221,8 @@ def main():
               "benchmark": "single-layer packed mixed high/low GQA KV reuse, FP16, head_size=128, four queries per KV head",
               "arguments": {**vars(args), "output": str(args.output)},
               "variants": VARIANTS,
-              "workspace_partition_bound": PARTITION_SIZE,
+              "workspace_partition_bound": {
+                  "reference": PARTITION_SIZE, "gqa-reuse": GQA_PARTITION_SIZE},
               "measurement": {"timer": "CUDA events, current stream, per-call milliseconds",
                               "baseline": "Existing sparse_paged_attention with correctness fixes; this is not the historical CUDA binary.",
                               "included": "attention main, reduce, score-cache update",
@@ -310,6 +316,7 @@ def main():
                 for name, samples in measurements.items():
                     case["timing"][name] = {
                         **stats(samples), "workspace_bytes": runners[name]["workspace_bytes"],
+                        "workspace_partition_bound": runners[name]["partition_size"],
                         "max_num_partitions": runners[name]["partitions"],
                         "paired_speedup_over_reference": [baseline / value for baseline, value in
                                                            zip(measurements["reference"], samples)]}

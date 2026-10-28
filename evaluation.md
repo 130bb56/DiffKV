@@ -428,3 +428,22 @@ Worker results: completed=6.
 - [상세 검증 결과](./logs/performance/v1-refactor-validation-20261016-161706/validation.json)
 - [CUDA correctness 출력](./logs/performance/v1-refactor-validation-20261016-161706/correctness.txt)
 - [측정 중 GPU 상태 관찰](./logs/performance/v1-refactor-validation-20261016-161706/gpu-state-observation.json)
+
+
+## R1-Distill-Llama-8B, MATH-500, DiffKV v1, 2026-10-23
+
+50-question seeded screening completed. HF versus patched FP16 greedy validation matched 384/384 output token IDs. Both correctness and performance screening rules passed. [Detailed report](evaluation-logs/r1-math50-20261023/report.md), [audited analysis](evaluation-logs/r1-math50-20261023/analysis.json).
+
+| Metric | FP16 | DiffKV v1 |
+|---|---:|---:|
+| Natural EOS accuracy | 40/50, 80% | 39/50, 78% |
+| Natural mean output tokens | 3481.10 | 3667.64 |
+| GPU 0 mean E2E, matched per-request output lengths, s | 249.303 | 167.247 |
+| GPU 0 mean TTFT, ms | 2119.146 | 866.806 |
+| GPU 0 mean TPOT, ms/token | 83.786 | 47.653 |
+| GPU 0 total generated tokens | 174055 | 174055 |
+| GPU 0 preemptions | 67 | 0 |
+
+Mean E2E speedup is 1.4906x. Natural output-length ratio is 1.053587; this counts actual generated tokens and does not classify meaningful tokens. Accuracy uses natural EOS runs, performance uses FP16 natural on GPU 0 and DiffKV replay on the same GPU with ignore_eos and each request's observed FP16 length. Replay outputs are excluded from accuracy.
+
+Both engines use max_model_len=max_num_batched_tokens=9216, increased equally from 8704 because the longest selected prompt has 776 tokens and the output allowance is 8192. Other settings: max_num_seqs=64, eager, swap=0, gpu_memory_utilization=0.9, temperature=0.6, top_p=0.95, seed=42. DiffKV v1 is no-sync-bulk-lengths, K8V4/K4V2, thresholds [0.02,1.0]. The initial DiffKV metadata environment error was recovered using the existing common benchmark environment; the detailed report retains the failed attempt and measured retry. One sample and one run per path, no statistical equivalence or performance variance claim.

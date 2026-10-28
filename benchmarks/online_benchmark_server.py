@@ -1,4 +1,4 @@
-"""Common HTTP benchmark adapter for the original FP16 and DiffKV async engines.
+"""Common HTTP benchmark adapter for FP16 and selected DiffKV async engines.
 
 The adapter observes the existing scheduler and async step at runtime. It does
 not change scheduling, add CUDA synchronization, or edit either engine source.
@@ -153,11 +153,19 @@ class PhaseObserver:
             metadata, output, ignored = original_schedule(*args, **kwargs)
             self.current_step = None
             if metadata:
+                scheduled_at = time.perf_counter()
                 phase = "prefill" if output.prompt_run else "decode"
                 before = {}
                 actual_tokens = initial_tokens = recompute_tokens = 0
                 batch = 0
                 for item in metadata:
+                    stats = self.request_stats.setdefault(str(item.request_id), {})
+                    stats.setdefault("first_scheduled_perf", scheduled_at)
+                    stats["last_scheduled_perf"] = scheduled_at
+                    stats[phase + "_steps"] = stats.get(phase + "_steps", 0) + 1
+                    if "preempted_since_perf" in stats:
+                        stats["recompute_wait_s"] = stats.get("recompute_wait_s", 0.0) + (
+                            scheduled_at - stats.pop("preempted_since_perf"))
                     counts = [data.get_output_len() for data in item.seq_data.values()]
                     if len(counts) != 1:
                         raise RuntimeError("Online benchmark requires n=1, one sequence per request")
@@ -178,6 +186,8 @@ class PhaseObserver:
                     "padded_tokens": int(output.num_batched_tokens),
                 }
             self.sample_state()
+            if self.current_step is not None:
+                self.current_step["scheduler_state"] = dict(self.current_state)
             return metadata, output, ignored
 
         @functools.wraps(original_step)
@@ -195,6 +205,11 @@ class PhaseObserver:
                 phase = observed["phase"]
                 self.phase_seconds[phase] += elapsed
                 self.phase_steps[phase] += 1
+                state = observed["scheduler_state"]
+                self.running_request_seconds += state["running"] * elapsed
+                self.waiting_request_seconds += state["waiting"] * elapsed
+                self.kv_usage_percent_seconds += state["kv_usage_percent"] * elapsed
+                self.phase_batch_seconds[phase][observed["batch"]] += elapsed
                 emitted = 0
                 for output in outputs:
                     previous = observed["before"].get(output.request_id)
@@ -225,6 +240,11 @@ class PhaseObserver:
         @functools.wraps(original_preempt)
         def preempt(*args, **kwargs):
             self.preemption_count += 1
+            group = args[0] if args else kwargs.get("seq_group")
+            if group is not None:
+                stats = self.request_stats.setdefault(str(group.request_id), {})
+                stats["preemptions"] = stats.get("preemptions", 0) + 1
+                stats.setdefault("preempted_since_perf", time.perf_counter())
             return original_preempt(*args, **kwargs)
 
         scheduler._preempt = preempt
@@ -243,6 +263,7 @@ class PhaseObserver:
         self.phase_seconds = Counter()
         self.phase_tokens = Counter()
         self.phase_steps = Counter()
+        self.phase_batch_seconds = {"prefill": Counter(), "decode": Counter()}
         self.emitted_tokens = Counter()
         self.decode_batch_histogram = Counter()
         self.prefill_batch_histogram = Counter()
@@ -257,6 +278,37 @@ class PhaseObserver:
         self.current_state = {}
         self.engine_error = None
         self.reset_time = time.time()
+        self.reset_perf = time.perf_counter()
+        self.request_stats = {}
+        self.running_request_seconds = self.waiting_request_seconds = 0.0
+        self.kv_usage_percent_seconds = 0.0
+
+    def request_received(self, request_id, prompt_tokens, max_tokens):
+        self.request_stats[str(request_id)] = {
+            "received_perf": time.perf_counter(), "prompt_tokens": prompt_tokens,
+            "max_tokens": max_tokens, "preemptions": 0, "recompute_wait_s": 0.0,
+        }
+
+    def request_output(self, request_id, count, finished):
+        stats = self.request_stats.setdefault(str(request_id), {})
+        now = time.perf_counter()
+        if count:
+            stats.setdefault("first_token_perf", now)
+        stats["output_tokens"] = count
+        if finished:
+            stats["finished_perf"] = now
+
+    def request_timing(self, request_id):
+        stats = self.request_stats[str(request_id)]
+        received = stats.get("received_perf")
+        timing = {key: value for key, value in stats.items() if not key.endswith("_perf")}
+        for key in ("received", "first_scheduled", "first_token", "finished"):
+            timestamp = stats.get(key + "_perf")
+            if timestamp is not None:
+                timing[key + "_offset_s"] = timestamp - self.reset_perf
+                if received is not None:
+                    timing[key + "_after_received_s"] = timestamp - received
+        return timing
 
     def sample_state(self):
         scheduler = self.engine.scheduler
@@ -280,7 +332,7 @@ class PhaseObserver:
             "total_gpu_blocks": total, "kv_usage_percent": usage,
         }
 
-    def snapshot(self):
+    def snapshot(self, include_requests=True):
         self.sample_state()
         histogram = self.decode_batch_histogram
         steps = sum(histogram.values())
@@ -289,6 +341,11 @@ class PhaseObserver:
             "phase_seconds": {name: self.phase_seconds[name] for name in ("prefill", "decode")},
             "phase_tokens": {name: self.phase_tokens[name] for name in ("prefill", "decode")},
             "phase_steps": {name: self.phase_steps[name] for name in ("prefill", "decode")},
+            "phase_batch_seconds": {name: dict(self.phase_batch_seconds[name])
+                                    for name in ("prefill", "decode")},
+            "running_request_seconds": self.running_request_seconds,
+            "waiting_request_seconds": self.waiting_request_seconds,
+            "kv_usage_percent_seconds": self.kv_usage_percent_seconds,
             "emitted_tokens": {name: self.emitted_tokens[name] for name in ("prefill", "decode")},
             "prefill_tokens_s": (self.phase_tokens["prefill"] / self.phase_seconds["prefill"]
                                  if self.phase_seconds["prefill"] else None),
@@ -313,11 +370,16 @@ class PhaseObserver:
             "max_pending_frontend": self.max_pending_frontend,
             "max_kv_usage_percent": self.max_kv_usage_percent,
             "state": self.current_state, "engine_error": self.engine_error,
+            **({"requests": {key: self.request_timing(key) for key in self.request_stats}}
+               if include_requests else {}),
             "definitions": {
                 "phase_seconds": "Sum of async engine step wall times; scheduling, model, sampling, detokenization; no added CUDA synchronization; excludes HTTP transport",
                 "prefill_tokens_s": "Actual prefill tokens, including recomputed context and excluding padding, divided by prefill step seconds",
                 "decode_tokens_s": "New output tokens emitted in decode steps divided by decode step seconds; excludes output tokens emitted in prefill steps",
                 "max_kv_usage_percent": "Peak observed physical GPU KV allocator block usage at schedule and async step boundaries",
+                "request_first_scheduled_after_received_s": "HTTP adapter receipt after payload validation to first scheduling; includes async frontend and scheduler waiting, excludes network/event-loop delay before receipt and subsequent preemption waits",
+                "request_recompute_wait_s": "Sum of intervals from preemption to subsequent scheduling; not model execution time",
+                "state_time_integrals": "Scheduled state multiplied by async step elapsed time, aggregated over nonempty model steps; excludes time between steps",
             },
         }
 
@@ -332,8 +394,8 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
     counters = Counter()
     errors = []
 
-    def metrics():
-        return {"backend": args.backend, **observer.snapshot(),
+    def metrics(include_requests=True):
+        return {"backend": args.backend, **observer.snapshot(include_requests=include_requests),
                 "submitted": counters["submitted"], "completed": counters["completed"],
                 "failed": counters["failed"], "active": len(active),
                 "errors": list(errors), "metadata": metadata}
@@ -341,7 +403,7 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
     async def progress():
         while True:
             await asyncio.sleep(30)
-            value = metrics()
+            value = metrics(include_requests=False)
             save_json(args.output_dir / "server-metrics.json", value)
             state = value["state"]
             print(f"PROGRESS {args.backend} completed={value['completed']} "
@@ -366,9 +428,11 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
         return {"status": "ready", "backend": args.backend}
 
     @app.get("/metrics")
-    async def get_metrics():
-        value = metrics()
-        save_json(args.output_dir / "server-metrics.json", value)
+    async def get_metrics(include_requests: bool = True):
+        value = metrics(include_requests=include_requests)
+        if include_requests:
+            save_json(args.output_dir / "server-metrics.json", value)
+            save_json(args.output_dir / "server-metrics-full.json", value)
         return value
 
     @app.post("/reset")
@@ -419,6 +483,8 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
         seen.add(request_id)
         active.add(request_id)
         counters["submitted"] += 1
+        observer.request_received(request_id, len(prompt_ids) if prompt_ids is not None else None,
+                                  max_tokens)
         if args.backend == "diffkv":
             iterator = async_engine.generate(
                 prompt, sampling, BITS, GROUPS, THRESHOLDS, request_id,
@@ -439,6 +505,7 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
                     if count < last_count:
                         raise RuntimeError("Generated token count decreased")
                     last_count = count
+                    observer.request_output(request_id, count, bool(output.finished))
                     frame = {"request_id": request_id, "output_tokens": count,
                              "prompt_tokens": len(output.prompt_token_ids),
                              "finished": bool(output.finished)}
@@ -451,6 +518,9 @@ def build_app(async_engine, observer, sampling_class, args, metadata):
                             frame["stop_token_ids"] = options["stop_token_ids"]
                             frame["effective_eos_token_ids"] = metadata.get("effective_eos_token_ids", [])
                     if output.finished:
+                        frame["output_token_ids_sha256"] = hashlib.sha256(json.dumps(
+                            list(completion.token_ids), separators=(",", ":")).encode()).hexdigest()
+                        frame["server_timing"] = observer.request_timing(request_id)
                         frame["text"] = completion.text
                         frame["finish_reason"] = completion.finish_reason
                         validate_output_length(count, max_tokens, options["ignore_eos"],
@@ -500,6 +570,8 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--monitor-output", action="store_true")
+    parser.add_argument("--diffkv-variant", choices=["original", "no-sync", "no-sync-bulk-lengths"],
+                        default="no-sync-bulk-lengths")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int, default=100)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
@@ -517,6 +589,7 @@ def main():
     repo = FP16_REPO if args.backend == "fp16" else ROOT
     metadata = {"status": "initializing", "backend": args.backend,
                 "model": str(args.model.resolve()), "pid": os.getpid(),
+                "server_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "monitor_output": args.monitor_output,
                 "monitoring_interval_tokens": 32 if args.monitor_output else None}
     path = args.output_dir / "server-metadata.json"
@@ -567,6 +640,7 @@ def main():
         metadata.update({"common_engine_args": common, "backend_engine_args": specific,
                          "source_commit": git(repo, "rev-parse", "HEAD"),
                          "vllm_import": vllm.__file__, "extension_import": vllm._C.__file__,
+                         "extension_sha256": hashlib.sha256(Path(vllm._C.__file__).read_bytes()).hexdigest(),
                          "async_engine_source": inspect.getfile(AsyncLLMEngine),
                          "gpu_name": torch.cuda.get_device_name(0),
                          "gpu_uuid": str(getattr(torch.cuda.get_device_properties(0), "uuid", "")),
@@ -584,6 +658,17 @@ def main():
         metadata["eos_configuration_source"] = str(args.model.resolve() / "generation_config.json")
         print(f"EOS {args.backend}: {metadata['effective_eos_token_ids']}", flush=True)
         worker = get_worker(engine, args.backend)
+        if args.backend == "diffkv":
+            from diffkv_v1 import apply_variant
+            metadata["python_variant"] = apply_variant(
+                engine, worker, args.diffkv_variant, args.output_dir / "variant")
+            metadata["diffkv_variant"] = args.diffkv_variant
+            metadata["async_variant_note"] = (
+                "Attention forward and decode metadata use the selected variant. "
+                "The inherited synchronous step is patched for consistency, while this server "
+                "executes the original step_async, which has no explicit CUDA synchronization.")
+        else:
+            metadata["diffkv_variant"] = None
         metadata["weights_verification"] = verify_weights(torch, worker, args.model.resolve())
         metadata["cache_verification"] = verify_cache(torch, worker, args.backend, engine)
         metadata["gpu_cache_blocks"] = engine.cache_config.num_gpu_blocks

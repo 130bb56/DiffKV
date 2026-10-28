@@ -1182,6 +1182,13 @@ void sparse_paged_attention_launcher(
   const int q_stride = query.stride(0);
   const int unified_page_size = kv_cache.size(1);
 
+  // Payload vectors have an 8-byte alignment requirement. Contiguous slices
+  // can still have an unaligned storage offset, so validate the base as well
+  // as the page stride before issuing vector loads.
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(kv_cache.data_ptr()) % alignof(k_vec_type) == 0 &&
+              (unified_page_size * sizeof(uint16_t)) % alignof(k_vec_type) == 0,
+              "Attention cache base and page stride must be 8-byte aligned");
+
   assert(head_size % THREAD_GROUP_SIZE_K == 0);
   assert(head_size % WARP_SIZE == 0);
   assert(WARP_SIZE % THREAD_GROUP_SIZE_K == 0);
@@ -1464,7 +1471,7 @@ void sparse_paged_attention_gqa_reduce(
   int layer_idx,
   int num_kv_heads,
   int max_context_len) {
-  constexpr int PARTITION_SIZE = 5760;
+  constexpr int PARTITION_SIZE = 240;
   const int max_num_partitions = max_context_len <= PARTITION_SIZE
     ? 1 : DIVIDE_ROUND_UP(max_context_len, PARTITION_SIZE) + 1;
   const dim3 grid(num_kv_heads, out.size(0));
