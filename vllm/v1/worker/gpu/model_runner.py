@@ -210,7 +210,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.device = device
         self.diffkv_state = None
         if getattr(vllm_config.attention_config.backend, "name", None) == "DIFFKV_V2":
-            from vllm.diffkv_v2.runner import DiffKVRunnerState
+            from diffkv_v2.runner import DiffKVRunnerState
 
             self.diffkv_state = DiffKVRunnerState(vllm_config)
         self.dtype = self.model_config.dtype

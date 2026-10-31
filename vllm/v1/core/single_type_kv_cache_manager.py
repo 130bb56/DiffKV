@@ -2640,8 +2640,8 @@ def register_all_kvcache_specs(vllm_config):
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
-    from vllm.diffkv_v2.scheduler import DiffKVBlockManager
-    from vllm.diffkv_v2.spec import DiffKVSpec
+    from diffkv_v2.scheduler import DiffKVBlockManager
+    from diffkv_v2.spec import DiffKVSpec
 
     KVCacheSpecRegistry.register(
         DiffKVSpec, DiffKVBlockManager, uniform_type_base_spec=DiffKVSpec

@@ -42,7 +42,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     """
 
     FLASH_ATTN = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
-    DIFFKV_V2 = "vllm.diffkv_v2.backend.DiffKVV2Backend"
+    DIFFKV_V2 = "diffkv_v2.backend.DiffKVV2Backend"
     FLASH_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )

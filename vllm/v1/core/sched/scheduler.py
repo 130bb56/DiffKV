@@ -325,7 +325,7 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
-        from vllm.diffkv_v2.scheduler import DiffKVKVCacheManager, uses_diffkv
+        from diffkv_v2.scheduler import DiffKVKVCacheManager, uses_diffkv
 
         self.diffkv_cache = uses_diffkv(kv_cache_config)
         if self.diffkv_cache and (

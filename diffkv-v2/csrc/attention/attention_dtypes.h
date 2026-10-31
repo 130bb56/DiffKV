@@ -1,0 +1,6 @@
+#pragma once
+
+#include "attention_generic.cuh"
+#include "dtype_float16.cuh"
+#include "dtype_float32.cuh"
+#include "dtype_int8.cuh"

@@ -232,8 +232,9 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
-!benchmarks/diffkv_v2/fixtures/math50.json
-!benchmarks/diffkv_v2/fixtures/lengths50.json
+!diffkv-v2/benchmarks/math500/problems/math500_sample50.json
+!diffkv-v2/benchmarks/math500/problems/math500_all.json
+!diffkv-v2/benchmarks/math500/serving/offline/output_lengths_sample50.json
 
 # Linting
 actionlint
