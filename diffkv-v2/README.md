@@ -38,13 +38,13 @@ diffkv-v2/
 | `vllm/v1/core/single_type_kv_cache_manager.py` | `DiffKVSpec` 등록 |
 | `vllm/v1/worker/gpu/model_runner.py` | request 추가, 제거, preempt, batch 시작과 끝마다 DiffKV 호출 |
 | `vllm/v1/outputs.py` | worker가 잰 cache 사용량을 scheduler로 보내는 `diffkv_cache_report` 필드 |
-| `vllm/config/vllm.py` | `DIFFKV_V2`일 때 Model Runner V2 사용 |
 
 ## 실행 환경
 
 - host가 Ubuntu 18.04(glibc 2.27)라서 torch 2.13이 로드되지 않음 → 모든 명령은 `diffkv-v2/run_docker.sh`로 container 안에서 실행
 - venv: `.venv` (container 안 Python 3.12). `site-packages/diffkv_v2.pth`가 `diffkv-v2/python`과 `diffkv-v2/benchmarks`를 import 경로에 넣음
 - CUDA toolkit: `.toolchains/cuda-12.9`, uv: `.toolchains/uv`
+- Nsight Systems: `run_docker.sh`가 host의 `/opt/nvidia/nsight-systems-cli/2024.4.1`을 container에 read-only로 mount (환경 변수 `DIFFKV_NSYS_DIR`로 변경)
 - 모델: `models/DeepSeek-R1-Distill-Llama-8B`
 - GPU: 환경 변수 `DIFFKV_GPU` (기본 0)
 
@@ -57,6 +57,7 @@ repo 루트에서 실행합니다.
 | extension build | `bash diffkv-v2/run_docker.sh python -m diffkv_v2.build_ops` |
 | kernel 정확도 검사 | `bash diffkv-v2/run_docker.sh python diffkv-v2/benchmarks/attention/correctness.py` |
 | attention latency | `bash diffkv-v2/benchmarks/attention/run_latency.sh [batch ...]` (기본 1 8 50) |
+| attention profile (Nsight Systems) | `bash diffkv-v2/benchmarks/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | correctness | `bash diffkv-v2/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv-v2/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |
 | 두 실행 비교 | `bash diffkv-v2/run_docker.sh python diffkv-v2/benchmarks/math500/serving/offline/compare_offline_serving.py --reference <기준 outputs.json> --candidate <비교 outputs.json> --reference-backend <backend> --candidate-backend <backend>` |
@@ -85,7 +86,7 @@ repo 루트에서 실행합니다.
 | 두 실행 비교 | correctness 또는 serving/offline 아래 `<UTC>-compare-<기준>-vs-<비교>/` | `comparison.json` |
 | attention latency | `benchmarks/attention/logs/<UTC>-latency-b<batch>/` | `source_hashes.json`, `gpu_telemetry.csv`, `latency.json`, `console.log` |
 | kernel 정확도 검사 | `benchmarks/attention/logs/<UTC>-correctness/` | `correctness.json` |
-| Nsight Systems | `benchmarks/attention/logs/<UTC>-nsys-b<batch>-kv<길이>/` | `cuda_events.json`, `kernel_attribution.json` |
+| attention profile (Nsight Systems) | `benchmarks/attention/logs/<UTC>-nsys-b<batch>-kv<길이>/` | `source_hashes.json`, `gpu_telemetry.csv`, `cuda_events.json`, `trace.nsys-rep`, `trace.sqlite`, `kernel_attribution.json`, `console.log` |
 
 경로는 모두 `diffkv-v2/` 아래입니다.
 
@@ -102,5 +103,4 @@ repo 루트에서 실행합니다.
 
 ## 제한
 
-- Nsight Systems 측정: `run_docker.sh`가 nsys를 container에 넣지 않아 지금은 그대로 실행되지 않음
 - online serving 측정 스크립트 없음

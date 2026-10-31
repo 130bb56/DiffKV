@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from diffkv_v2.cache import DiffKVCacheController
 from diffkv_v2.ops import PARTITION_SIZE, QUANT_ARGS, get_extension
+from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -328,6 +329,18 @@ class DiffKVV2Impl(AttentionImpl[DiffKVV2Metadata]):
         kv_sharing_target_layer_name: str | None = None,
         **kwargs,
     ) -> None:
+        # The DiffKV hooks exist only in Model Runner V2 (vllm/v1/worker/gpu/).
+        # vLLM 0.32 selects Model Runner V2 automatically unless
+        # VLLM_USE_V2_MODEL_RUNNER=0, Triton is missing, or a feature V2 does not
+        # support is enabled (pipeline parallel with external_launcher, some
+        # speculative decoding methods, ubatching):
+        # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L703-L739
+        # https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L2914-L2953
+        if not get_current_vllm_config().use_v2_model_runner:
+            raise ValueError(
+                "DIFFKV_V2 requires Model Runner V2, but vLLM selected the V1 "
+                "model runner"
+            )
         if head_size != 128 or num_kv_heads is None or num_heads != num_kv_heads * 4:
             raise ValueError("DiffKV-v2 requires head size 128 and GQA factor 4")
         if (

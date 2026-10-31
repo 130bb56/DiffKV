@@ -8,9 +8,15 @@ set -euo pipefail
 
 diffkv_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 diffkv_image=${DIFFKV_CONTAINER_IMAGE:-sha256:ca18e2f9134073dc2cc5d9899d7d9974e321008ecc4ab7745477eeb5508befe8}
+# Host Nsight Systems, mounted read-only so `nsys` works inside the container.
+nsys_dir=${DIFFKV_NSYS_DIR:-/opt/nvidia/nsight-systems-cli/2024.4.1}
+nsys_mount=()
+if [ -d "$nsys_dir" ]; then
+  nsys_mount=(-v "$nsys_dir:$nsys_dir:ro" -e "NSYS_BIN=$nsys_dir/target-linux-x64")
+fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
-  --user "$(id -u):$(id -g)" \
+  --user "$(id -u):$(id -g)" "${nsys_mount[@]}" \
   -e CUDA_MODULE_LOADING=LAZY \
   -e CUDA_HOME="$diffkv_repo/.toolchains/cuda-12.9" \
   -e TORCH_CUDA_ARCH_LIST=8.6 -e MAX_JOBS=2 \
@@ -22,5 +28,5 @@ exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
   -e TRITON_CACHE_DIR="$diffkv_repo/.cache/bringup/triton" \
   -e UV_CACHE_DIR="$diffkv_repo/.cache/bringup/uv" \
   -v "$diffkv_repo:$diffkv_repo" -w "$diffkv_repo" "$diffkv_image" \
-  bash -lc 'export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:$PATH"; exec "$@"' \
+  bash -lc 'export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:${NSYS_BIN:+$NSYS_BIN:}$PATH"; exec "$@"' \
   bash "$@"
