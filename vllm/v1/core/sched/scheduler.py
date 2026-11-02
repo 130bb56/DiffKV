@@ -325,7 +325,7 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
-        from diffkv_v2.scheduler import DiffKVKVCacheManager, uses_diffkv
+        from diffkv.scheduler import DiffKVKVCacheManager, uses_diffkv
 
         self.diffkv_cache = uses_diffkv(kv_cache_config)
         if self.diffkv_cache and (
@@ -336,7 +336,7 @@ class Scheduler(SchedulerInterface):
             or self.parallel_config.pipeline_parallel_size != 1
         ):
             raise ValueError(
-                "DiffKV-v2 requires synchronous TP=1, PP=1 scheduling without "
+                "DiffKV requires synchronous TP=1, PP=1 scheduling without "
                 "speculative decoding or KV connectors"
             )
         manager_class = DiffKVKVCacheManager if self.diffkv_cache else KVCacheManager
