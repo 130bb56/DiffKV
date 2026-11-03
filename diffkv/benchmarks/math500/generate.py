@@ -340,10 +340,16 @@ def main():
             if len(selected) != 1:
                 raise ValueError(f"No single attention module in {prefix}")
             label = f"layer/{args.profile_layer}"
-            selected[0].register_forward_pre_hook(
-                lambda *_: torch.cuda.nvtx.range_push(label)
-            )
-            selected[0].register_forward_hook(lambda *_: torch.cuda.nvtx.range_pop())
+
+            # Hooks must return None; a returned value replaces inputs or output.
+            def push(*_):
+                torch.cuda.nvtx.range_push(label)
+
+            def pop(*_):
+                torch.cuda.nvtx.range_pop()
+
+            selected[0].register_forward_pre_hook(push)
+            selected[0].register_forward_hook(pop)
             metadata["profile_layer_module"] = next(
                 name for name, layer in forward_context.items() if layer is selected[0]
             )
