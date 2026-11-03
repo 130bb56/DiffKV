@@ -13,11 +13,11 @@
 # engine steps FIRST..FIRST+COUNT-1 and stops the run there. The directory gets
 # the suffix -nsys-s<FIRST>-n<COUNT> and also trace.nsys-rep, trace.sqlite and
 # step_breakdown.json (analyze_nsys_steps.py).
-# DIFFKV_NCU_STEP=<step> runs under Nsight Compute (--set full) and profiles
-# the attention, reduce and KV cache write kernels of measured engine step
-# <step>, then stops the run. The directory gets the suffix -ncu-s<step> and
-# also kernels.ncu-rep, kernels_raw.csv and kernel_summary.json
-# (analyze_ncu_kernels.py).
+# DIFFKV_NCU_STEPS="FIRST COUNT" runs under Nsight Compute (--set full) and
+# profiles the attention, reduce and KV cache write kernels of measured engine
+# steps FIRST..FIRST+COUNT-1, then stops the run. The directory gets the suffix
+# -ncu-s<FIRST>-n<COUNT> and also kernels.ncu-rep, kernels_raw.csv and
+# kernel_summary.json (analyze_ncu_kernels.py).
 set -euo pipefail
 
 backend=${1:?backend: fp16, diffkv or fp8}
@@ -32,17 +32,18 @@ run_docker=("bash" "$diffkv/run_docker.sh")
 suffix=
 profiler=()
 profile=()
-if [ -n "${DIFFKV_NSYS_STEPS:-}" ] && [ -n "${DIFFKV_NCU_STEP:-}" ]; then
-  echo "Set DIFFKV_NSYS_STEPS or DIFFKV_NCU_STEP, not both" >&2
+if [ -n "${DIFFKV_NSYS_STEPS:-}" ] && [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
+  echo "Set DIFFKV_NSYS_STEPS or DIFFKV_NCU_STEPS, not both" >&2
   exit 2
 fi
 if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
   read -r first count <<< "$DIFFKV_NSYS_STEPS"
   suffix="-nsys-s$first-n$count"
   profile=(--profile-steps "$first" "$count")
-elif [ -n "${DIFFKV_NCU_STEP:-}" ]; then
-  suffix="-ncu-s$DIFFKV_NCU_STEP"
-  profile=(--profile-steps "$DIFFKV_NCU_STEP" 1)
+elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
+  read -r first count <<< "$DIFFKV_NCU_STEPS"
+  suffix="-ncu-s$first-n$count"
+  profile=(--profile-steps "$first" "$count")
   export DIFFKV_SYS_ADMIN=1
 fi
 run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend$suffix"
@@ -51,7 +52,7 @@ if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
   profiler=(nsys profile --trace=cuda,nvtx,osrt --capture-range=cudaProfilerApi
     --capture-range-end=stop --sample=none --cpuctxsw=none
     --output "$run_dir/trace")
-elif [ -n "${DIFFKV_NCU_STEP:-}" ]; then
+elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   kernels="register_gqa_attention_kernel|register_gqa_reduce_kernel"
   kernels+="|compress_and_append_cache_decode_phase|BatchPrefillWithPagedKVCache"
   kernels+="|BatchDecodeWithPagedKVCache|MergeStates|reshape_and_cache"
@@ -84,7 +85,7 @@ if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
   "${run_docker[@]}" python "$here/analyze_nsys_steps.py" \
     --trace "$run_dir/trace.sqlite" --outputs "$run_dir/outputs.json" \
     --output "$run_dir/step_breakdown.json" >> "$run_dir/console.log" 2>&1
-elif [ -n "${DIFFKV_NCU_STEP:-}" ]; then
+elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   "${run_docker[@]}" ncu --import "$run_dir/kernels.ncu-rep" --csv --page raw \
     --print-units base > "$run_dir/kernels_raw.csv" 2>> "$run_dir/console.log"
   "${run_docker[@]}" python "$here/analyze_ncu_kernels.py" \

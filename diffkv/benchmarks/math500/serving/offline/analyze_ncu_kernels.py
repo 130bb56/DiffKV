@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Average Nsight Compute metrics per kernel over one profiled engine step.
+"""Average Nsight Compute metrics per kernel over the profiled engine steps.
 
 Reads kernels_raw.csv (`ncu --import ... --csv --page raw --print-units base`)
-from a run_offline_serving.sh DIFFKV_NCU_STEP run. Each kernel runs once per
-layer in the step; the summary averages its instances.
+from a run_offline_serving.sh DIFFKV_NCU_STEPS run. Each kernel runs once per
+layer in each step; the summary averages all its instances.
 """
 
 import argparse
@@ -86,7 +86,7 @@ def summarize(raw_path, outputs_path):
         "raw": str(raw_path),
         "definitions": {
             "mean": "Mean over the kernel's instances in the profiled step "
-            "(one per attention layer)",
+            "(one per attention layer per profiled step)",
             "stall ratios": "smsp__average_warps_issue_stalled_<reason>_per_issue_"
             "active.ratio: warps stalled on the reason per issued instruction",
         },
