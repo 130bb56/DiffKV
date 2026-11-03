@@ -32,6 +32,7 @@ run_docker=("bash" "$diffkv/run_docker.sh")
 suffix=
 profiler=()
 profile=()
+sys_admin=0
 if [ -n "${DIFFKV_NSYS_STEPS:-}" ] && [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   echo "Set DIFFKV_NSYS_STEPS or DIFFKV_NCU_STEPS, not both" >&2
   exit 2
@@ -44,7 +45,7 @@ elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   read -r first count <<< "$DIFFKV_NCU_STEPS"
   suffix="-ncu-s$first-n$count"
   profile=(--profile-steps "$first" "$count")
-  export DIFFKV_SYS_ADMIN=1
+  sys_admin=1
 fi
 run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend$suffix"
 mkdir -p "$run_dir"
@@ -70,7 +71,8 @@ trap 'kill "$telemetry" 2>/dev/null || true' EXIT
 
 "${run_docker[@]}" python "$math500/record_source_hashes.py" \
   --output "$run_dir/source_hashes.json"
-"${run_docker[@]}" env FLASHINFER_EXTRA_CUDAFLAGS=--compress-mode=none \
+DIFFKV_SYS_ADMIN=$sys_admin "${run_docker[@]}" \
+  env FLASHINFER_EXTRA_CUDAFLAGS=--compress-mode=none \
   "${profiler[@]}" python "$math500/generate.py" --backend "$backend" \
   --model "$repo/models/DeepSeek-R1-Distill-Llama-8B" \
   --expected-count 50 --mode length_replay \
@@ -86,6 +88,9 @@ if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
     --trace "$run_dir/trace.sqlite" --outputs "$run_dir/outputs.json" \
     --output "$run_dir/step_breakdown.json" >> "$run_dir/console.log" 2>&1
 elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
+  # The profiled run executed as root; return its files to the caller.
+  docker run --rm -v "$run_dir:$run_dir" "$image" \
+    chown -R "$(id -u):$(id -g)" "$run_dir"
   "${run_docker[@]}" ncu --import "$run_dir/kernels.ncu-rep" --csv --page raw \
     --print-units base > "$run_dir/kernels_raw.csv" 2>> "$run_dir/console.log"
   "${run_docker[@]}" python "$here/analyze_ncu_kernels.py" \

@@ -45,7 +45,7 @@ diffkv/
 - venv: `.venv` (container 안 Python 3.12). `site-packages/diffkv.pth`가 `diffkv/python`과 `diffkv/benchmarks`를 import 경로에 넣음
 - CUDA toolkit: `.toolchains/cuda-12.9`, uv: `.toolchains/uv`
 - Nsight Systems: `run_docker.sh`가 host의 `/opt/nvidia/nsight-systems-cli/2024.4.1`을 container에 read-only로 mount (환경 변수 `DIFFKV_NSYS_DIR`로 변경)
-- Nsight Compute: `run_docker.sh`가 host의 `/opt/nvidia/nsight-compute/2023.3.0`을 container에 read-only로 mount (환경 변수 `DIFFKV_NCU_DIR`로 변경). driver가 GPU 성능 counter를 관리자만 읽게 설정돼 있어서(`RmProfilingAdminOnly: 1`) ncu는 `DIFFKV_SYS_ADMIN=1`(container에 `--cap-add=SYS_ADMIN`)이 있어야 동작
+- Nsight Compute: `run_docker.sh`가 host의 `/opt/nvidia/nsight-compute/2023.3.0`을 container에 read-only로 mount (환경 변수 `DIFFKV_NCU_DIR`로 변경). driver가 GPU 성능 counter를 관리자만 읽게 설정돼 있어서(`RmProfilingAdminOnly: 1`) ncu는 `DIFFKV_SYS_ADMIN=1`이 있어야 동작. 이 모드는 container를 `--cap-add=SYS_ADMIN`과 root로 실행함. container 안 일반 사용자 프로세스에는 `--cap-add`로 준 권한이 적용되지 않아 `ERR_NVGPUCTRPERM`이 남. `run_offline_serving.sh`는 profile 실행이 끝나면 결과 디렉터리의 파일 소유자를 실행한 사용자로 되돌림
 - 모델: `models/DeepSeek-R1-Distill-Llama-8B`
 - GPU: 환경 변수 `DIFFKV_GPU` (기본 0)
 - git worktree에서 실행할 때: worktree 루트의 `.venv`, `.toolchains`, `models`, `.cache`와 `vllm/` 안의 미리 빌드된 파일(`git status --ignored vllm`으로 보이는 `.so`, `_version.py`, `third_party/` 등)을 기본 checkout으로 가리키는 symlink로 만들어 둠. `run_docker.sh`는 기본 checkout을 read-only로(`.cache`만 쓰기 가능) 같이 mount하고, `PYTHONPATH`로 worktree의 `diffkv`와 `vllm`을 먼저 import함

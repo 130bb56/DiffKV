@@ -16,13 +16,17 @@ if [ -d "$nsys_dir" ]; then
 fi
 # Host Nsight Compute, mounted read-only so `ncu` works inside the container.
 # The driver restricts GPU performance counters to admins
-# (RmProfilingAdminOnly=1), so ncu also needs DIFFKV_SYS_ADMIN=1.
+# (RmProfilingAdminOnly=1), so ncu also needs DIFFKV_SYS_ADMIN=1. The driver
+# checks the profiled process itself, and a non-root user in the container
+# does not hold CAP_SYS_ADMIN even with --cap-add, so that mode runs as root.
 ncu_dir=${DIFFKV_NCU_DIR:-/opt/nvidia/nsight-compute/2023.3.0}
 if [ -d "$ncu_dir" ]; then
   profiler_args+=(-v "$ncu_dir:$ncu_dir:ro" -e "NCU_BIN=$ncu_dir")
 fi
+user=(--user "$(id -u):$(id -g)")
 if [ "${DIFFKV_SYS_ADMIN:-0}" = 1 ]; then
   profiler_args+=(--cap-add=SYS_ADMIN)
+  user=(--user 0:0)
 fi
 # A linked git worktree symlinks .venv, .toolchains, models, .cache and the
 # precompiled vllm binaries to the primary checkout. Mount that checkout
@@ -37,7 +41,7 @@ if [ "$primary_repo" != "$diffkv_repo" ]; then
 fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
-  --user "$(id -u):$(id -g)" "${profiler_args[@]}" "${worktree_mount[@]}" \
+  "${user[@]}" "${profiler_args[@]}" "${worktree_mount[@]}" \
   -e CUDA_MODULE_LOADING=LAZY \
   -e CUDA_HOME="$diffkv_repo/.toolchains/cuda-12.9" \
   -e TORCH_CUDA_ARCH_LIST=8.6 -e MAX_JOBS=2 \
