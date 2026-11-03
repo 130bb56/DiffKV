@@ -18,7 +18,7 @@ diffkv/
     │   ├── test_generation.py        CPU test
     │   ├── problems/                 Correctness test를 위한 benchmark dataset
     │   ├── correctness/              run_correctness.sh, score_outputs.py (답 추출, 정답 판정, 집계)
-    │   ├── serving/offline/
+    │   ├── serving/offline/          run_offline_serving.sh, analyze_nsys_steps.py (nsys step별 GPU 시간 분해)
     │   ├── serving/online/           
     │   └── logs/
     └── attention/
@@ -47,6 +47,7 @@ diffkv/
 - Nsight Systems: `run_docker.sh`가 host의 `/opt/nvidia/nsight-systems-cli/2024.4.1`을 container에 read-only로 mount (환경 변수 `DIFFKV_NSYS_DIR`로 변경)
 - 모델: `models/DeepSeek-R1-Distill-Llama-8B`
 - GPU: 환경 변수 `DIFFKV_GPU` (기본 0)
+- git worktree에서 실행할 때: worktree 루트의 `.venv`, `.toolchains`, `models`, `.cache`와 `vllm/` 안의 미리 빌드된 파일(`git status --ignored vllm`으로 보이는 `.so`, `_version.py`, `third_party/` 등)을 기본 checkout으로 가리키는 symlink로 만들어 둠. `run_docker.sh`는 기본 checkout을 read-only로(`.cache`만 쓰기 가능) 같이 mount하고, `PYTHONPATH`로 worktree의 `diffkv`와 `vllm`을 먼저 import함
 
 ## 실행 명령
 
@@ -60,6 +61,7 @@ repo 루트에서 실행합니다.
 | attention profile (Nsight Systems) | `bash diffkv/benchmarks/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | correctness | `bash diffkv/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |
+| offline serving step 분해 (Nsight Systems) | `DIFFKV_NSYS_STEPS="<첫 step> <step 수>" bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>`: 측정 구간의 engine step(0부터 셈) 중 지정한 구간만 trace하고 그 뒤 실행을 멈춤. 결과 디렉터리 이름에 `-nsys-s<첫 step>-n<step 수>`, `trace.nsys-rep`, `trace.sqlite`, `step_breakdown.json`(step별 wall 시간, GPU busy와 idle 시간, kernel 종류별 시간, 동기화 API 호출 수) 추가 |
 | 두 실행 비교 | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/serving/offline/compare_offline_serving.py --reference <기준 outputs.json> --candidate <비교 outputs.json> --reference-backend <backend> --candidate-backend <backend>` |
 | harness test | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/test_generation.py` |
 
@@ -76,6 +78,22 @@ repo 루트에서 실행합니다.
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
 - clock 고정은 docker(`--cap-add=SYS_ADMIN`)로 `nvidia-smi -lgc 1395,1395` 실행
+
+### offline serving의 step별 동시 decode 요청 수
+
+`serving/offline/output_lengths_sample50.json`의 요청별 출력 길이에서 계산한 값. step은 측정 구간의 engine step(0부터 셈), 요청 수는 출력 길이가 그 step보다 긴 요청 수. DiffKV가 처음 약 50 step 동안 새 요청을 step마다 하나씩만 받는 것과 FP8의 preemption은 빠져 있음. 실제 값은 nsys 실행의 `outputs.json` `profile.per_step`에 step마다 기록됨. 문맥 길이는 prompt 길이(32~776 token, 중앙값 83)에 step을 더한 값
+
+| step | 0~783 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | 5000 | 6000 | 7000 | 7348~8191 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 동시 decode 요청 | 50 | 46 | 40 | 27 | 25 | 20 | 19 | 17 | 14 | 13 | 12 | 11 |
+
+nsys step 분해 구간 (2026-11-03): 동시 decode 요청이 가장 많은 구간, 중간 구간, 가장 적은 구간에서 32 step씩
+
+| 구간 | `DIFFKV_NSYS_STEPS` | 동시 decode 요청 |
+| --- | --- | --- |
+| 최대 | `740 32` | 50 |
+| 중간 | `3000 32` | 20 |
+| 최소 | `7800 32` | 11 |
 
 ## 제한
 

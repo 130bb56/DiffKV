@@ -9,6 +9,10 @@
 # Results: math500/logs/serving/offline/<UTC>-sample50-<backend>/
 #   source_hashes.json, gpu_telemetry.csv, outputs.json, console.log
 # DIFFKV_GPU picks the GPU (default 0).
+# DIFFKV_NSYS_STEPS="FIRST COUNT" runs under Nsight Systems, traces measured
+# engine steps FIRST..FIRST+COUNT-1 and stops the run there. The directory gets
+# the suffix -nsys-s<FIRST>-n<COUNT> and also trace.nsys-rep, trace.sqlite and
+# step_breakdown.json (analyze_nsys_steps.py).
 set -euo pipefail
 
 backend=${1:?backend: fp16, diffkv or fp8}
@@ -20,8 +24,21 @@ math500=$(cd -- "$here/../.." && pwd)
 diffkv=$(cd -- "$math500/../.." && pwd)
 repo=$(dirname -- "$diffkv")
 run_docker=("bash" "$diffkv/run_docker.sh")
-run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend"
+suffix=
+nsys=()
+profile=()
+if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
+  read -r first count <<< "$DIFFKV_NSYS_STEPS"
+  suffix="-nsys-s$first-n$count"
+  profile=(--profile-steps "$first" "$count")
+fi
+run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend$suffix"
 mkdir -p "$run_dir"
+if [ -n "$suffix" ]; then
+  nsys=(nsys profile --trace=cuda,nvtx,osrt --capture-range=cudaProfilerApi
+    --capture-range-end=stop --sample=none --cpuctxsw=none
+    --output "$run_dir/trace")
+fi
 
 docker run --rm --gpus "\"device=$gpu\"" --cap-add=SYS_ADMIN "$image" \
   nvidia-smi -i 0 -lgc 1395,1395
@@ -34,9 +51,17 @@ trap 'kill "$telemetry" 2>/dev/null || true' EXIT
 "${run_docker[@]}" python "$math500/record_source_hashes.py" \
   --output "$run_dir/source_hashes.json"
 "${run_docker[@]}" env FLASHINFER_EXTRA_CUDAFLAGS=--compress-mode=none \
-  python "$math500/generate.py" --backend "$backend" \
+  "${nsys[@]}" python "$math500/generate.py" --backend "$backend" \
   --model "$repo/models/DeepSeek-R1-Distill-Llama-8B" \
   --expected-count 50 --mode length_replay \
   --lengths-from "$here/output_lengths_sample50.json" \
-  --output "$run_dir/outputs.json" > "$run_dir/console.log" 2>&1
+  --output "$run_dir/outputs.json" "${profile[@]}" > "$run_dir/console.log" 2>&1
+if [ -n "$suffix" ]; then
+  kill "$telemetry" 2>/dev/null || true
+  "${run_docker[@]}" nsys export --type sqlite --output "$run_dir/trace.sqlite" \
+    "$run_dir/trace.nsys-rep" >> "$run_dir/console.log" 2>&1
+  "${run_docker[@]}" python "$here/analyze_nsys_steps.py" \
+    --trace "$run_dir/trace.sqlite" --outputs "$run_dir/outputs.json" \
+    --output "$run_dir/step_breakdown.json" >> "$run_dir/console.log" 2>&1
+fi
 echo "$run_dir"

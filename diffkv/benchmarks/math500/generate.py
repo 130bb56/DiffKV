@@ -180,7 +180,17 @@ def parse_args():
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--warmup-tokens", type=int, default=32)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        nargs=2,
+        metavar=("FIRST", "COUNT"),
+        help="for nsys --capture-range=cudaProfilerApi: capture measured engine "
+        "steps FIRST..FIRST+COUNT-1 with one NVTX range per step, then stop the run",
+    )
     args = parser.parse_args()
+    if args.profile_steps and (args.profile_steps[0] < 0 or args.profile_steps[1] < 1):
+        parser.error("--profile-steps needs FIRST >= 0 and COUNT >= 1")
     if args.workload is None:
         args.workload = PROBLEMS[args.expected_count]
     if args.output is None:
@@ -285,6 +295,7 @@ def main():
     save_json(args.output, result)
     engine = None
     try:
+        import torch
         from tokenizers import Tokenizer
 
         from vllm import SamplingParams
@@ -390,8 +401,19 @@ def main():
         metadata["registration_s"] = time.perf_counter() - started
         last_progress = started
         elapsed = 0.0
+        profile_first, profile_count = args.profile_steps or (-1, 0)
+        profiled_steps = []
+        step = 0
         while engine.has_unfinished_requests():
+            profiling = profile_first <= step < profile_first + profile_count
+            if profiling and step == profile_first:
+                torch.cuda.synchronize()
+                torch.cuda.profiler.start()
+            if profiling:
+                torch.cuda.nvtx.range_push(f"step/{step}")
             outputs = engine.step()
+            if profiling:
+                torch.cuda.nvtx.range_pop()
             now = time.perf_counter()
             elapsed = now - started
             for output in outputs:
@@ -411,6 +433,44 @@ def main():
                 save_json(args.output, result)
                 print(json.dumps(result["progress"]), flush=True)
                 last_progress = now
+            if profiling:
+                contexts = [
+                    len(recorder.requests[output.request_id]["prompt_token_ids"])
+                    + recorder.counts[output.request_id]
+                    for output in outputs
+                ]
+                profiled_steps.append(
+                    {
+                        "step": step,
+                        "outputs": len(outputs),
+                        "max_context_tokens": max(contexts, default=0),
+                        "mean_context_tokens": sum(contexts) / len(contexts)
+                        if contexts
+                        else 0,
+                    }
+                )
+                if step == profile_first + profile_count - 1:
+                    torch.cuda.synchronize()
+                    torch.cuda.profiler.stop()
+                    break
+            step += 1
+        if args.profile_steps:
+            if len(profiled_steps) != profile_count:
+                raise RuntimeError("The run ended before the profiled steps")
+            result["requests"] = list(recorder.completed.values())
+            result["profile"] = {
+                "first_step": profile_first,
+                "steps": profile_count,
+                "nvtx_range": "step/<measured engine step index, from 0>",
+                "context_tokens": "prompt tokens + generated tokens after the step, "
+                "over requests with an output in the step",
+                "per_step": profiled_steps,
+            }
+            result["status"] = "profiled"
+            metadata["finished_utc"] = datetime.now(UTC).isoformat()
+            save_json(args.output, result)
+            print(json.dumps(result["profile"]["per_step"][-1]), flush=True)
+            return
         result["requests"] = recorder.rows()
         mismatches = 0
         for row in result["requests"]:

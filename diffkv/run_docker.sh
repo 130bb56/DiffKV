@@ -14,9 +14,20 @@ nsys_mount=()
 if [ -d "$nsys_dir" ]; then
   nsys_mount=(-v "$nsys_dir:$nsys_dir:ro" -e "NSYS_BIN=$nsys_dir/target-linux-x64")
 fi
+# A linked git worktree symlinks .venv, .toolchains, models, .cache and the
+# precompiled vllm binaries to the primary checkout. Mount that checkout
+# read-only (its .cache writable) and import diffkv and vllm from this tree.
+primary_repo=$(dirname -- "$(git -C "$diffkv_repo" rev-parse \
+  --path-format=absolute --git-common-dir)")
+worktree_mount=()
+if [ "$primary_repo" != "$diffkv_repo" ]; then
+  worktree_mount=(-v "$primary_repo:$primary_repo:ro"
+    -v "$primary_repo/.cache:$primary_repo/.cache"
+    -e "PYTHONPATH=$diffkv_repo/diffkv/python:$diffkv_repo/diffkv/benchmarks:$diffkv_repo")
+fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
-  --user "$(id -u):$(id -g)" "${nsys_mount[@]}" \
+  --user "$(id -u):$(id -g)" "${nsys_mount[@]}" "${worktree_mount[@]}" \
   -e CUDA_MODULE_LOADING=LAZY \
   -e CUDA_HOME="$diffkv_repo/.toolchains/cuda-12.9" \
   -e TORCH_CUDA_ARCH_LIST=8.6 -e MAX_JOBS=2 \
