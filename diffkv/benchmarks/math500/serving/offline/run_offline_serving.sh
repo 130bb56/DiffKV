@@ -57,7 +57,7 @@ elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   kernels+="|compress_and_append_cache_decode_phase|BatchPrefillWithPagedKVCache"
   kernels+="|BatchDecodeWithPagedKVCache|MergeStates|reshape_and_cache"
   profiler=(ncu --profile-from-start off --set full --kernel-name "regex:$kernels"
-    --output "$run_dir/kernels")
+    --export "$run_dir/kernels")
 fi
 
 docker run --rm --gpus "\"device=$gpu\"" --cap-add=SYS_ADMIN "$image" \
