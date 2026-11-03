@@ -188,9 +188,17 @@ def parse_args():
         help="for nsys --capture-range=cudaProfilerApi: capture measured engine "
         "steps FIRST..FIRST+COUNT-1 with one NVTX range per step, then stop the run",
     )
+    parser.add_argument(
+        "--profile-layer",
+        type=int,
+        help="wrap this decoder layer's attention module in an NVTX range "
+        "layer/<index>, for ncu --nvtx-include",
+    )
     args = parser.parse_args()
     if args.profile_steps and (args.profile_steps[0] < 0 or args.profile_steps[1] < 1):
         parser.error("--profile-steps needs FIRST >= 0 and COUNT >= 1")
+    if args.profile_layer is not None and not args.profile_steps:
+        parser.error("--profile-layer needs --profile-steps")
     if args.workload is None:
         args.workload = PROBLEMS[args.expected_count]
     if args.output is None:
@@ -322,6 +330,23 @@ def main():
             for layer in forward_context.values()
             if hasattr(layer, "attn_backend")
         ]
+        if args.profile_layer is not None:
+            prefix = f"layers.{args.profile_layer}."
+            selected = [
+                layer
+                for name, layer in forward_context.items()
+                if prefix in name and hasattr(layer, "attn_backend")
+            ]
+            if len(selected) != 1:
+                raise ValueError(f"No single attention module in {prefix}")
+            label = f"layer/{args.profile_layer}"
+            selected[0].register_forward_pre_hook(
+                lambda *_: torch.cuda.nvtx.range_push(label)
+            )
+            selected[0].register_forward_hook(lambda *_: torch.cuda.nvtx.range_pop())
+            metadata["profile_layer_module"] = next(
+                name for name, layer in forward_context.items() if layer is selected[0]
+            )
         metadata["kv_cache"]["resolved_cache_dtype"] = (
             engine.vllm_config.cache_config.cache_dtype
         )

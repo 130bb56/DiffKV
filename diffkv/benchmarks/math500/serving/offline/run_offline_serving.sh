@@ -17,7 +17,8 @@
 # profiles the attention, reduce and KV cache write kernels of measured engine
 # steps FIRST..FIRST+COUNT-1, then stops the run. The directory gets the suffix
 # -ncu-s<FIRST>-n<COUNT> and also kernels.ncu-rep, kernels_raw.csv and
-# kernel_summary.json (analyze_ncu_kernels.py).
+# kernel_summary.json (analyze_ncu_kernels.py). DIFFKV_NCU_LAYER=<index> limits
+# it to that decoder layer's attention module (suffix -l<index>).
 set -euo pipefail
 
 backend=${1:?backend: fp16, diffkv or fp8}
@@ -46,6 +47,10 @@ elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   suffix="-ncu-s$first-n$count"
   profile=(--profile-steps "$first" "$count")
   sys_admin=1
+  if [ -n "${DIFFKV_NCU_LAYER:-}" ]; then
+    suffix+="-l$DIFFKV_NCU_LAYER"
+    profile+=(--profile-layer "$DIFFKV_NCU_LAYER")
+  fi
 fi
 run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend$suffix"
 mkdir -p "$run_dir"
@@ -59,6 +64,9 @@ elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   kernels+="|BatchDecodeWithPagedKVCache|MergeStates|reshape_and_cache"
   profiler=(ncu --profile-from-start off --set full --kernel-name "regex:$kernels"
     --export "$run_dir/kernels")
+  if [ -n "${DIFFKV_NCU_LAYER:-}" ]; then
+    profiler+=(--nvtx --nvtx-include "layer/$DIFFKV_NCU_LAYER/")
+  fi
 fi
 
 docker run --rm --gpus "\"device=$gpu\"" --cap-add=SYS_ADMIN "$image" \
