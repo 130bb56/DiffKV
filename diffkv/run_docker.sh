@@ -25,7 +25,9 @@ if [ -d "$ncu_dir" ]; then
 fi
 user=(--user "$(id -u):$(id -g)")
 if [ "${DIFFKV_SYS_ADMIN:-0}" = 1 ]; then
-  profiler_args+=(--cap-add=SYS_ADMIN)
+  # git refuses a repository owned by another user unless safe.directory allows it.
+  profiler_args+=(--cap-add=SYS_ADMIN -e GIT_CONFIG_COUNT=1
+    -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
   user=(--user 0:0)
 fi
 # A linked git worktree symlinks .venv, .toolchains, models, .cache and the
