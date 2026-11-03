@@ -45,6 +45,7 @@ diffkv/
 - venv: `.venv` (container 안 Python 3.12). `site-packages/diffkv.pth`가 `diffkv/python`과 `diffkv/benchmarks`를 import 경로에 넣음
 - CUDA toolkit: `.toolchains/cuda-12.9`, uv: `.toolchains/uv`
 - Nsight Systems: `run_docker.sh`가 host의 `/opt/nvidia/nsight-systems-cli/2024.4.1`을 container에 read-only로 mount (환경 변수 `DIFFKV_NSYS_DIR`로 변경)
+- Nsight Compute: `run_docker.sh`가 host의 `/opt/nvidia/nsight-compute/2023.3.0`을 container에 read-only로 mount (환경 변수 `DIFFKV_NCU_DIR`로 변경). driver가 GPU 성능 counter를 관리자만 읽게 설정돼 있어서(`RmProfilingAdminOnly: 1`) ncu는 `DIFFKV_SYS_ADMIN=1`(container에 `--cap-add=SYS_ADMIN`)이 있어야 동작
 - 모델: `models/DeepSeek-R1-Distill-Llama-8B`
 - GPU: 환경 변수 `DIFFKV_GPU` (기본 0)
 - git worktree에서 실행할 때: worktree 루트의 `.venv`, `.toolchains`, `models`, `.cache`와 `vllm/` 안의 미리 빌드된 파일(`git status --ignored vllm`으로 보이는 `.so`, `_version.py`, `third_party/` 등)을 기본 checkout으로 가리키는 symlink로 만들어 둠. `run_docker.sh`는 기본 checkout을 read-only로(`.cache`만 쓰기 가능) 같이 mount하고, `PYTHONPATH`로 worktree의 `diffkv`와 `vllm`을 먼저 import함
@@ -62,6 +63,7 @@ repo 루트에서 실행합니다.
 | correctness | `bash diffkv/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |
 | offline serving step 분해 (Nsight Systems) | `DIFFKV_NSYS_STEPS="<첫 step> <step 수>" bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>`: 측정 구간의 engine step(0부터 셈) 중 지정한 구간만 trace하고 그 뒤 실행을 멈춤. 결과 디렉터리 이름에 `-nsys-s<첫 step>-n<step 수>`, `trace.nsys-rep`, `trace.sqlite`, `step_breakdown.json`(step별 wall 시간, GPU busy와 idle 시간, kernel 종류별 시간, 동기화 API 호출 수) 추가 |
+| offline serving kernel 분석 (Nsight Compute) | `DIFFKV_NCU_STEP=<step> bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <diffkv\|fp8>`: 지정한 engine step 하나에서 attention, reduce, KV cache 쓰기 kernel(`register_gqa_attention_kernel`, `register_gqa_reduce_kernel`, `compress_and_append_cache_decode_phase`, FlashInfer attention, `reshape_and_cache`)을 `--set full`로 재고 실행을 멈춤. 결과 디렉터리 이름에 `-ncu-s<step>`, `kernels.ncu-rep`, `kernels_raw.csv`, `kernel_summary.json`(kernel별 layer 평균: 시간, DRAM 사용률, occupancy, register, stall 이유, pipe 사용률) 추가 |
 | 두 실행 비교 | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/serving/offline/compare_offline_serving.py --reference <기준 outputs.json> --candidate <비교 outputs.json> --reference-backend <backend> --candidate-backend <backend>` |
 | harness test | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/test_generation.py` |
 

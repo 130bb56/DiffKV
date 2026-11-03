@@ -10,9 +10,19 @@ diffkv_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 diffkv_image=${DIFFKV_CONTAINER_IMAGE:-sha256:ca18e2f9134073dc2cc5d9899d7d9974e321008ecc4ab7745477eeb5508befe8}
 # Host Nsight Systems, mounted read-only so `nsys` works inside the container.
 nsys_dir=${DIFFKV_NSYS_DIR:-/opt/nvidia/nsight-systems-cli/2024.4.1}
-nsys_mount=()
+profiler_args=()
 if [ -d "$nsys_dir" ]; then
-  nsys_mount=(-v "$nsys_dir:$nsys_dir:ro" -e "NSYS_BIN=$nsys_dir/target-linux-x64")
+  profiler_args=(-v "$nsys_dir:$nsys_dir:ro" -e "NSYS_BIN=$nsys_dir/target-linux-x64")
+fi
+# Host Nsight Compute, mounted read-only so `ncu` works inside the container.
+# The driver restricts GPU performance counters to admins
+# (RmProfilingAdminOnly=1), so ncu also needs DIFFKV_SYS_ADMIN=1.
+ncu_dir=${DIFFKV_NCU_DIR:-/opt/nvidia/nsight-compute/2023.3.0}
+if [ -d "$ncu_dir" ]; then
+  profiler_args+=(-v "$ncu_dir:$ncu_dir:ro" -e "NCU_BIN=$ncu_dir")
+fi
+if [ "${DIFFKV_SYS_ADMIN:-0}" = 1 ]; then
+  profiler_args+=(--cap-add=SYS_ADMIN)
 fi
 # A linked git worktree symlinks .venv, .toolchains, models, .cache and the
 # precompiled vllm binaries to the primary checkout. Mount that checkout
@@ -27,7 +37,7 @@ if [ "$primary_repo" != "$diffkv_repo" ]; then
 fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
-  --user "$(id -u):$(id -g)" "${nsys_mount[@]}" "${worktree_mount[@]}" \
+  --user "$(id -u):$(id -g)" "${profiler_args[@]}" "${worktree_mount[@]}" \
   -e CUDA_MODULE_LOADING=LAZY \
   -e CUDA_HOME="$diffkv_repo/.toolchains/cuda-12.9" \
   -e TORCH_CUDA_ARCH_LIST=8.6 -e MAX_JOBS=2 \
@@ -39,5 +49,5 @@ exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
   -e TRITON_CACHE_DIR="$diffkv_repo/.cache/bringup/triton" \
   -e UV_CACHE_DIR="$diffkv_repo/.cache/bringup/uv" \
   -v "$diffkv_repo:$diffkv_repo" -w "$diffkv_repo" "$diffkv_image" \
-  bash -lc 'export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:${NSYS_BIN:+$NSYS_BIN:}$PATH"; exec "$@"' \
+  bash -lc 'export PATH="$PWD/.venv/bin:$CUDA_HOME/bin:${NSYS_BIN:+$NSYS_BIN:}${NCU_BIN:+$NCU_BIN:}$PATH"; exec "$@"' \
   bash "$@"
