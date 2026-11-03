@@ -259,7 +259,9 @@ def _make_fp8(fixture, baseline_arguments, use_tensor_cores=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--contexts", type=int, nargs="+", default=[512, 2048, 8192])
+    parser.add_argument(
+        "--contexts", type=int, nargs="+", default=[1024, 2048, 4096, 8192]
+    )
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--high-fraction", type=float, default=0.25)
     parser.add_argument("--repeat-ms", type=int, default=500)

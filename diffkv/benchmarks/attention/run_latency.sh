@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Decode attention latency for DiffKV, vLLM FA2 FP16 and FlashInfer FP8 at KV
-# lengths 512, 2048 and 8192, one run per batch size. The GPU SM clock is locked
+# lengths 1024, 2048, 4096 and 8192, one run per batch size. The GPU SM clock is locked
 # to 1395 MHz and GPU telemetry is recorded.
-# Usage: run_latency.sh [batch ...]   (default: 1 8 50)
+# Usage: run_latency.sh [batch ...]   (default: 1 8 32)
 # Results: attention/logs/<UTC>-latency-b<batch>/
 #   source_hashes.json, gpu_telemetry.csv, latency.json, console.log
 # DIFFKV_GPU picks the GPU (default 0).
@@ -12,7 +12,7 @@ set -euo pipefail
 
 batches=("$@")
 if [ ${#batches[@]} -eq 0 ]; then
-  batches=(1 8 50)
+  batches=(1 8 32)
 fi
 gpu=${DIFFKV_GPU:-0}
 image=${DIFFKV_CONTAINER_IMAGE:-sha256:ca18e2f9134073dc2cc5d9899d7d9974e321008ecc4ab7745477eeb5508befe8}
