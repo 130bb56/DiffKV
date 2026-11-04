@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DiffKV request lifecycle hooks for the eager V2 model runner."""
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -40,7 +41,8 @@ class DiffKVRunnerState:
             raise ValueError("DIFFKV does not support " + ", ".join(rejected))
         self.config = config
         self.controller = None
-        self.last_report: dict[str, Any] | None = None
+        # finish_batch leaves a pending report that attach_report completes.
+        self.last_report: dict[str, Any] | Callable[[], dict[str, Any]] | None = None
 
     def profile_workspace(self, device: torch.device) -> torch.Tensor:
         """Include cache metadata and peak attention scratch in memory profiling."""
@@ -131,5 +133,7 @@ class DiffKVRunnerState:
     def attach_report(self, output, *, refresh: bool = False):
         if refresh and self.controller is not None:
             self.last_report = self.controller.report()
+        elif callable(self.last_report):
+            self.last_report = self.last_report()
         # Empty upstream outputs can be shared singletons.
         return replace(output, diffkv_cache_report=self.last_report)
