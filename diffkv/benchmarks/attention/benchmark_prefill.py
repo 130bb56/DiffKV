@@ -279,8 +279,7 @@ def make_fp8(batch, prompt, kv_heads):
     wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
     wrapper.plan(
         qo_indptr=starts,
-        paged_kv_indptr=torch.arange(batch + 1, dtype=torch.int32)
-        * pages_per_request,
+        paged_kv_indptr=torch.arange(batch + 1, dtype=torch.int32) * pages_per_request,
         paged_kv_indices=torch.arange(pages, dtype=torch.int32, device="cuda"),
         paged_kv_last_page_len=torch.full(
             (batch,), (prompt - 1) % BLOCK_SIZE + 1, dtype=torch.int32

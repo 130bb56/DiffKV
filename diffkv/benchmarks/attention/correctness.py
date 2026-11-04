@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 HEAD_SIZE = 128
@@ -418,21 +419,73 @@ PREFILL_CASES = {
 }
 
 
+def read_region(cache, pages, count, bits):
+    """Per-token records of one region, the inverse of _write_region's layout.
+
+    Returns packed K and V codes, FP16 metadata, scores and positions of the
+    first `count` tokens, plus `order`, their indices sorted by the bytes of
+    position, codes and metadata (positions repeat: the writer stores
+    max(position, prompt_len - 64) for the decode score mean).
+    """
+    k_bits, v_bits, tokens = bits
+    layout = page_layout(k_bits, v_bits, tokens)
+    fields = {"k_packed": [], "v_packed": [], "k_meta": [], "v_meta": []}
+    fields.update(score=[], position=[])
+    for page_idx in range(-(-count // tokens)):
+        page = cache[pages[page_idx].item()]
+        n = min(tokens, count - page_idx * tokens)
+        k_page = page[: tokens * layout.k_packs].reshape(
+            layout.k_packs // 16, tokens, 4, 4
+        )
+        fields["k_packed"].append(
+            k_page.permute(1, 2, 0, 3).reshape(tokens, layout.k_packs)[:n]
+        )
+        v_page = page[
+            layout.value : layout.value + layout.padded_tokens * layout.v_packs
+        ].reshape(layout.v_packs // 8, layout.padded_tokens // 2, 8, 2)
+        fields["v_packed"].append(
+            v_page.permute(1, 3, 2, 0).reshape(layout.padded_tokens, layout.v_packs)[:n]
+        )
+        for name, base in (("k_meta", layout.k_meta), ("v_meta", layout.v_meta)):
+            fields[name].append(page[base : base + 2 * n].reshape(n, 2))
+        fields["score"].append(
+            page.view(torch.float32)[layout.score // 2 : layout.score // 2 + n]
+        )
+        fields["position"].append(
+            page.view(torch.int32)[layout.position // 2 : layout.position // 2 + n]
+        )
+    records = {
+        name: torch.cat(values) if values else torch.empty(0)
+        for name, values in fields.items()
+    }
+    if not count:
+        records["order"] = torch.empty(0, dtype=torch.long)
+        return records
+    rows = torch.cat(
+        [
+            records["position"].view(torch.int16).reshape(-1, 2),
+            *(records[name] for name in ("k_packed", "v_packed", "k_meta", "v_meta")),
+        ],
+        dim=1,
+    ).numpy()
+    records["order"] = torch.from_numpy(np.lexsort(rows.T[::-1]))
+    return records
+
+
 def check_prefill(lengths, kv_heads=8):
     """prompt_prefill against the backend prefill path on the same inputs.
 
     Both paths start from freshly admitted requests. Attention output, the
-    group-maximum scores, retained lengths and every packed page of the layer
-    must agree.
+    group-maximum scores, retained lengths and every retained token of the
+    layer must agree.
     """
     from attention.benchmark_prefill import admit_requests, qkv_inputs, serving_prefill
-
     from diffkv.prefill import prompt_prefill
 
     query, key, value, starts = qkv_inputs(lengths, kv_heads)
     reference, request_ids = admit_requests(lengths, kv_heads)
     candidate, _ = admit_requests(lengths, kv_heads)
-    expected = serving_prefill(
+    expected_output = serving_prefill(
         reference,
         request_ids,
         starts.tolist(),
@@ -457,7 +510,7 @@ def check_prefill(lengths, kv_heads=8):
         LAYER_IDX,
     )
     torch.accelerator.synchronize()
-    torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(output, expected_output, atol=1e-3, rtol=1e-3)
     maximum_score_error = 0.0
     for row, (req_id, length) in enumerate(zip(request_ids, lengths)):
         sums = reference.prompt_scores(req_id)[LAYER_IDX]
@@ -476,17 +529,51 @@ def check_prefill(lengths, kv_heads=8):
             getattr(candidate, name)[slots, LAYER_IDX],
         ):
             raise AssertionError(f"Prompt compression changed {name}")
-    pages = reference.block_tables[slots, LAYER_IDX]
-    pages = pages[pages >= 0].long()
-    differing = (
-        (reference.kv_cache[pages] != candidate.kv_cache[pages]).any(dim=1).sum()
-    )
-    if differing:
-        raise AssertionError(f"{differing.item()} packed pages differ")
+    # The writer places tokens in score order, so near-equal scores from
+    # differently ordered FP32 sums may swap two tokens' slots. Compare each
+    # head's tokens matched by content: payload, metadata and positions bit
+    # for bit, the stored score to tolerance.
+    lengths_table = reference.kv_len_tables[slots, LAYER_IDX].cpu()
+    tables = reference.block_tables[slots, LAYER_IDX].cpu()
+    caches = reference.kv_cache.cpu(), candidate.kv_cache.cpu()
+    maximum_stored_score_error = 0.0
+    tokens_compared = 0
+    for row in range(len(lengths)):
+        for head in range(kv_heads):
+            high, low = lengths_table[row, head].tolist()
+            high_pages = -(-high // 32)
+            regions = (
+                ((8, 4, 32), tables[row, head, :high_pages], high),
+                ((4, 2, 60), tables[row, head, high_pages:], low),
+            )
+            for bits, pages, count in regions:
+                expected, actual = (
+                    read_region(cache, pages, count, bits) for cache in caches
+                )
+                expected, actual = (
+                    {key: value[records["order"]] for key, value in records.items()}
+                    for records in (expected, actual)
+                )
+                for name in ("position", "k_packed", "v_packed", "k_meta", "v_meta"):
+                    if not torch.equal(expected[name], actual[name]):
+                        raise AssertionError(
+                            f"Prompt compression changed {name} of row {row}, "
+                            f"KV head {head}, {bits[0]}-bit keys"
+                        )
+                torch.testing.assert_close(
+                    actual["score"], expected["score"], atol=1e-6, rtol=1e-3
+                )
+                if count:
+                    maximum_stored_score_error = max(
+                        maximum_stored_score_error,
+                        (actual["score"] - expected["score"]).abs().max().item(),
+                    )
+                tokens_compared += count
     return {
-        "output_max_abs_error": (output - expected).abs().max().item(),
+        "output_max_abs_error": (output - expected_output).abs().max().item(),
         "score_max_abs_error": maximum_score_error,
-        "packed_pages_compared": pages.numel(),
+        "stored_score_max_abs_error": maximum_stored_score_error,
+        "tokens_compared": tokens_compared,
     }
 
 
