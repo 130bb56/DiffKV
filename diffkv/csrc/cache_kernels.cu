@@ -26,8 +26,11 @@
 
 namespace diffkv {
 // Phase 1 of the prompt-phase writer: one block per (KV head, sequence)
-// computes mean scores, the pruned and quantized counts and the score
-// order, writes the retained lengths and stores the sorted positions.
+// computes mean scores and the pruned and quantized counts, writes the
+// retained lengths and stores the token order phase 2 writes: pruned tokens
+// first (not stored), then low precision, then high precision tokens, each
+// group in position order. Mean score thresholds decide the groups, so this
+// keeps the token sets of the original ascending score sort.
 template <typename scalar_t, int HEAD_SIZE, int BITS_K_HIGH, int BITS_V_HIGH,
           int BITS_K_LOW, int BITS_V_LOW, int CHUNKS_K_HIGH, int CHUNKS_V_HIGH,
           int CHUNKS_K_LOW, int CHUNKS_V_LOW, int NUM_TOKENS_PER_PAGE_HIGH,
@@ -54,177 +57,36 @@ __global__ void select_prompt_tokens_kernel(
     const int kv_stride, const int num_layers, const int num_heads,
     const int num_kv_heads, const int unified_page_size,
     const int max_num_blocks_per_seq) {
+  constexpr int NUM_WARPS = NUM_THREADS_PROMPT / WARP_SIZE;
   const int seq_idx = blockIdx.y;
   const int slot_idx = slot_ids[seq_idx];
   const int kv_head_idx = blockIdx.x;
   const int num_queries_per_kv = num_heads / num_kv_heads;
   const int thread_idx = threadIdx.x;
+  const int lane = thread_idx % WARP_SIZE;
+  const int warp = thread_idx / WARP_SIZE;
 
   const int prompt_start = seq_start_loc[seq_idx];
-  const int prompt_end = seq_start_loc[seq_idx + 1];
-  const int prompt_len = prompt_end - prompt_start;
-  const int prompt_len_power2 = POWER2_ROUND_UP(prompt_len);
-  const int max_prompt_len_power2 = POWER2_ROUND_UP(max_prompt_len);
+  const int prompt_len = seq_start_loc[seq_idx + 1] - prompt_start;
 
   extern __shared__ char shared_memory[];
-  // s_scores and s_keep are of size max_prompt_len (no padding)
-  // s_mean_scores and s_positions are of size max_prompt_len_power2 (with
-  // padding) Padding is due to the requirement of bitonic sort.
-  // TODO(yuwei): can we get rid of padding?
   float* s_mean_scores = reinterpret_cast<float*>(shared_memory);
+  __shared__ int s_warp_low[NUM_WARPS];
+  __shared__ int s_warp_high[NUM_WARPS];
 
-  size_t s_positions_offset = max_prompt_len_power2 * sizeof(float);
-  int* s_positions = reinterpret_cast<int*>(shared_memory + s_positions_offset);
-
-  size_t s_scores_offset =
-      s_positions_offset + max_prompt_len_power2 * sizeof(int);
-  float* s_scores = reinterpret_cast<float*>(shared_memory + s_scores_offset);
-
-  // s_keep tracks whether tokens are kept at high precision or quantized to low
-  // precision or pruned. 1: kept at high precision, 2: quantized, 3: pruned.
-  // Using char type is as memory efficient as using bool type, since each bool
-  // is one byte.
-  // TODO(yuwei): We can actually get rid of s_keep for performance
-  // optimization; keep it now for better code readability. size_t s_keep_offset
-  // = s_scores_offset + max_prompt_len * sizeof(float); char* s_keep =
-  // reinterpret_cast<char*>(shared_memory + s_keep_offset);
-
-  const float range_k_high = get_quant_range(BITS_K_HIGH);
-  const float range_v_high = get_quant_range(BITS_V_HIGH);
-  const float range_k_low = get_quant_range(BITS_K_LOW);
-  const float range_v_low = get_quant_range(BITS_V_LOW);
-
-  constexpr int K_PACK_SIZE_HIGH = 16 / BITS_K_HIGH;
-  constexpr int V_PACK_SIZE_HIGH = 16 / BITS_V_HIGH;
-  constexpr int K_PACK_SIZE_LOW = 16 / BITS_K_LOW;
-  constexpr int V_PACK_SIZE_LOW = 16 / BITS_V_LOW;
-
-  constexpr int NUM_K_PACKS_HIGH = HEAD_SIZE / K_PACK_SIZE_HIGH;
-  constexpr int NUM_V_PACKS_HIGH = HEAD_SIZE / V_PACK_SIZE_HIGH;
-  constexpr int NUM_K_PACKS_LOW = HEAD_SIZE / K_PACK_SIZE_LOW;
-  constexpr int NUM_V_PACKS_LOW = HEAD_SIZE / V_PACK_SIZE_LOW;
-
-  constexpr int NUM_K_VECS_HIGH = NUM_K_PACKS_HIGH / K_VEC_SIZE;
-  constexpr int NUM_K_VECS_LOW = NUM_K_PACKS_LOW / K_VEC_SIZE;
-  constexpr int NUM_VECS_PER_THREAD_K_HIGH =
-      NUM_K_VECS_HIGH / THREAD_GROUP_SIZE_K;
-  constexpr int NUM_VECS_PER_THREAD_K_LOW =
-      NUM_K_VECS_LOW / THREAD_GROUP_SIZE_K;
-
-  constexpr int CHUNK_SIZE_K_HIGH = HEAD_SIZE / CHUNKS_K_HIGH;
-  constexpr int CHUNK_SIZE_V_HIGH = HEAD_SIZE / CHUNKS_V_HIGH;
-  constexpr int CHUNK_SIZE_K_LOW = HEAD_SIZE / CHUNKS_K_LOW;
-  constexpr int CHUNK_SIZE_V_LOW = HEAD_SIZE / CHUNKS_V_LOW;
-
-  constexpr int NUM_K_PACKS_HIGH_PER_GROUP = NUM_K_PACKS_HIGH / CHUNKS_K_HIGH;
-  constexpr int NUM_V_PACKS_HIGH_PER_GROUP = NUM_V_PACKS_HIGH / CHUNKS_V_HIGH;
-  constexpr int NUM_K_PACKS_LOW_PER_GROUP = NUM_K_PACKS_LOW / CHUNKS_K_LOW;
-  constexpr int NUM_V_PACKS_LOW_PER_GROUP = NUM_V_PACKS_LOW / CHUNKS_V_LOW;
-
-  // for mod operations
-  constexpr int LOG2_NUM_VECS_PER_THREAD_K_HIGH =
-      log2_of_pow2(NUM_VECS_PER_THREAD_K_HIGH);
-  constexpr int LOG2_NUM_VECS_PER_THREAD_K_LOW =
-      log2_of_pow2(NUM_VECS_PER_THREAD_K_LOW);
-  static_assert(LOG2_NUM_VECS_PER_THREAD_K_HIGH > 0);
-  static_assert(LOG2_NUM_VECS_PER_THREAD_K_LOW > 0);
-
-  static_assert(NUM_K_PACKS_HIGH % K_VEC_SIZE == 0);
-  static_assert(NUM_K_PACKS_LOW % K_VEC_SIZE == 0);
-  static_assert(NUM_K_VECS_HIGH % THREAD_GROUP_SIZE_K == 0);
-  static_assert(NUM_K_VECS_LOW % THREAD_GROUP_SIZE_K == 0);
-
-  constexpr int NUM_PACKS_PER_THREAD_V_HIGH =
-      NUM_V_PACKS_HIGH / THREAD_GROUP_SIZE_V;
-  constexpr int NUM_PACKS_PER_THREAD_V_LOW =
-      NUM_V_PACKS_LOW / THREAD_GROUP_SIZE_V;
-
-  // for mod operations
-  constexpr int LOG2_NUM_PACKS_PER_THREAD_V_HIGH =
-      log2_of_pow2(NUM_PACKS_PER_THREAD_V_HIGH);
-  constexpr int LOG2_NUM_PACKS_PER_THREAD_V_LOW =
-      log2_of_pow2(NUM_PACKS_PER_THREAD_V_LOW);
-  static_assert(LOG2_NUM_PACKS_PER_THREAD_V_HIGH >= 0);
-  static_assert(LOG2_NUM_PACKS_PER_THREAD_V_LOW >= 0);
-
-  static_assert(NUM_V_PACKS_HIGH % THREAD_GROUP_SIZE_V == 0);
-  static_assert(NUM_V_PACKS_LOW % THREAD_GROUP_SIZE_V == 0);
-
-  // Align the starting address of each segment (key, key meta, val, val meta,
-  // score, pos) to 32 bytes.
-  constexpr int KEY_BASE_HIGH = 0;
-  constexpr int KEY_META_BASE_HIGH =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * NUM_K_PACKS_HIGH * 2, 32) *
-          32 / sizeof(uint16_t) +
-      KEY_BASE_HIGH;
-  constexpr int VAL_BASE_HIGH =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * 4 * CHUNKS_K_HIGH +
-                          KEY_META_BASE_HIGH * sizeof(uint16_t),
-                      128) *
-      128 / sizeof(uint16_t);
-  constexpr int PADDED_NUM_TOKENS_PER_PAGE_HIGH =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH, V_VEC_SIZE) * V_VEC_SIZE;
-  constexpr int VAL_META_BASE_HIGH =
-      DIVIDE_ROUND_UP(PADDED_NUM_TOKENS_PER_PAGE_HIGH * NUM_V_PACKS_HIGH * 2,
-                      32) *
-          32 / sizeof(uint16_t) +
-      VAL_BASE_HIGH;
-  constexpr int SCORE_BASE_HIGH =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * 4 * CHUNKS_V_HIGH, 32) * 32 /
-          sizeof(uint16_t) +
-      VAL_META_BASE_HIGH;
-  constexpr int POSITION_BASE_HIGH =
-      NUM_TOKENS_PER_PAGE_HIGH * 4 / sizeof(uint16_t) + SCORE_BASE_HIGH;
-
-  constexpr int KEY_BASE_LOW = 0;
-  constexpr int KEY_META_BASE_LOW =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * NUM_K_PACKS_LOW * 2, 32) * 32 /
-          sizeof(uint16_t) +
-      KEY_BASE_LOW;
-  constexpr int VAL_BASE_LOW =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * 4 * CHUNKS_K_LOW +
-                          KEY_META_BASE_LOW * sizeof(uint16_t),
-                      128) *
-      128 / sizeof(uint16_t);
-  constexpr int PADDED_NUM_TOKENS_PER_PAGE_LOW =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW, V_VEC_SIZE) * V_VEC_SIZE;
-  constexpr int VAL_META_BASE_LOW =
-      DIVIDE_ROUND_UP(PADDED_NUM_TOKENS_PER_PAGE_LOW * NUM_V_PACKS_LOW * 2,
-                      32) *
-          32 / sizeof(uint16_t) +
-      VAL_BASE_LOW;
-  constexpr int SCORE_BASE_LOW =
-      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * 4 * CHUNKS_V_LOW, 32) * 32 /
-          sizeof(uint16_t) +
-      VAL_META_BASE_LOW;
-  constexpr int POSITION_BASE_LOW =
-      NUM_TOKENS_PER_PAGE_LOW * 4 / sizeof(uint16_t) + SCORE_BASE_LOW;
-
-  // make sure that each key vec only corresponds to one group of metadata
-  static_assert(NUM_K_PACKS_HIGH % (K_VEC_SIZE * CHUNKS_K_HIGH) == 0);
-  static_assert(NUM_K_PACKS_LOW % (K_VEC_SIZE * CHUNKS_K_LOW) == 0);
-
-  // Compute actual threshold
   const float base_threshold = 1.0f / prompt_len;
   const float prune_threshold =
       base_threshold * compress_config_tables[slot_idx * 2 + 0];
   const float quant_threshold =
       base_threshold * compress_config_tables[slot_idx * 2 + 1];
-
   assert(prune_threshold >= 0 && prune_threshold <= 1);
   assert(quant_threshold >= 0 && quant_threshold <= 1);
   assert(quant_threshold >= prune_threshold);
 
-  // Iterate over prompt_len dim
-  // float score_sum = 0.0f;
   int count_quantized = 0;
   int count_pruned = 0;
-
   for (int token_idx = thread_idx; token_idx < prompt_len;
        token_idx += NUM_THREADS_PROMPT) {
-    // Initialize s_keep
-    // s_keep[token_idx] = 1;
-    // Calculate the score
     float score_ = 0.0f;
     for (int j = 0; j < num_queries_per_kv; j++) {
       score_ =
@@ -233,97 +95,27 @@ __global__ void select_prompt_tokens_kernel(
                     (kv_head_idx * num_queries_per_kv + j) * max_prompt_len +
                     token_idx]);
     }
-    s_scores[token_idx] = score_;
-    // Calculate the mean score
-    int ideal_num_queries = prompt_len - token_idx;
-    int real_num_queries = MIN(ideal_num_queries, NUM_TOKENS_SCORE);
+    const int ideal_num_queries = prompt_len - token_idx;
+    const int real_num_queries = MIN(ideal_num_queries, NUM_TOKENS_SCORE);
     float mean_score = score_ / real_num_queries;
-    // score_sum += mean_score;
-
     if (ideal_num_queries > kv_buffer_size) {
-      // Prune the tokens whose score is smaller than prune_threshold
-      // Quantize the tokens score is smaller than quant_threshold otherwise
       if (mean_score < prune_threshold) {
         count_pruned += 1;
       } else if (mean_score < quant_threshold) {
         count_quantized += 1;
       }
     } else {
-      // For the last kv_buffer_size tokens, we set the mean score to 1.0 (the
-      // largest possible value after normalization) Those tokens are guaranteed
-      // not to be evicted.
+      // The last kv_buffer_size tokens stay at high precision.
       mean_score = 1.0f;
     }
-
-    // Update s_mean_scores, s_positions
     s_mean_scores[token_idx] = mean_score;
-    s_positions[token_idx] = token_idx;
   }
   __syncthreads();
-
-  // __shared__ int count_pruned;
-  // __shared__ int count_quantized;
-
   count_pruned = blockReduceSum<int>(count_pruned);
   __syncthreads();
   count_quantized = blockReduceSum<int>(count_quantized);
-
   assert(count_pruned + count_quantized <= prompt_len);
 
-  if (prompt_len <= kv_buffer_size) {
-    // Keep all tokens at high precision
-    if (thread_idx == 0) {
-      count_pruned = 0;
-      count_quantized = 0;
-    }
-    __syncthreads();
-  } else {
-    // // Normalize the scores
-    // score_sum = blockReduceSum<float>(score_sum);
-    // for (int token_idx = thread_idx; token_idx < prompt_len; token_idx +=
-    // NUM_THREADS_PROMPT) {
-    //   if (token_idx < prompt_len - kv_buffer_size) {
-    //     s_mean_scores[token_idx] /= score_sum;
-    //   } else {
-    //     // For the last kv_buffer_size tokens, we set the mean score to 1.0
-    //     (the largest possible value after normalization)
-    //     // Those tokens are guaranteed not to be evicted.
-    //     s_mean_scores[token_idx] = 1.0f;
-    //   }
-    // }
-    __syncthreads();
-
-    // Sort the mean scores in ascending order
-    bitonic_sort_ascend(s_mean_scores, s_positions, prompt_len);
-    __syncthreads();
-
-    if (DEBUG && layer_idx == 0 && slot_idx == 0 && kv_head_idx == 0 &&
-        thread_idx == 0) {
-      printf(
-          "\n[Debug info from compress_and_append_cache_prompt_phase_kernel], "
-          "seq_idx: %d, slot_idx: %d, layer_idx: %d\n",
-          seq_idx, slot_idx, layer_idx);
-      printf("Sorted mean scores:\n");
-      for (int token_idx = 0; token_idx < prompt_len_power2; token_idx++) {
-        printf("%f ", s_mean_scores[token_idx]);
-      }
-      printf("\n");
-      printf("Sorted positions:\n");
-      for (int token_idx = 0; token_idx < prompt_len_power2; token_idx++) {
-        printf("%d ", s_positions[token_idx]);
-      }
-      printf("\n");
-      // printf("s_keep:\n");
-      // for (int token_idx = 0; token_idx < prompt_len; token_idx++) {
-      //   printf("%d ", s_keep[token_idx]);
-      // }
-      // printf("\n");
-      printf("count_pruned = %d\n", count_pruned);
-      printf("count_quantized = %d\n", count_quantized);
-    }
-  }
-
-  // Update kv_len_tables
   if (thread_idx == 0) {
     const int kv_len_tables_offset = slot_idx * num_layers * num_kv_heads * 2 +
                                      layer_idx * num_kv_heads * 2 +
@@ -332,19 +124,51 @@ __global__ void select_prompt_tokens_kernel(
         prompt_len - count_pruned - count_quantized;
     kv_len_tables[kv_len_tables_offset + 1] = count_quantized;
   }
-  __syncthreads();
 
+  // Stable partition, NUM_THREADS_PROMPT tokens at a time: warp ballots give
+  // each token its rank within its warp and the warp totals its warp offset.
   int* head_sorted_positions =
       sorted_positions +
       (static_cast<int64_t>(seq_idx) * num_kv_heads + kv_head_idx) *
           max_prompt_len;
-  for (int token_idx = thread_idx; token_idx < prompt_len;
-       token_idx += NUM_THREADS_PROMPT) {
-    head_sorted_positions[token_idx] = s_positions[token_idx];
+  int next_low = count_pruned;
+  int next_high = count_pruned + count_quantized;
+  const unsigned lanes_before = (1u << lane) - 1;
+  for (int chunk = 0; chunk < prompt_len; chunk += NUM_THREADS_PROMPT) {
+    const int token_idx = chunk + thread_idx;
+    const float mean_score =
+        token_idx < prompt_len ? s_mean_scores[token_idx] : -1.0f;
+    const bool high = mean_score >= quant_threshold;
+    const bool low = !high && mean_score >= prune_threshold;
+    const unsigned low_mask = __ballot_sync(0xffffffff, low);
+    const unsigned high_mask = __ballot_sync(0xffffffff, high);
+    if (lane == 0) {
+      s_warp_low[warp] = __popc(low_mask);
+      s_warp_high[warp] = __popc(high_mask);
+    }
+    __syncthreads();
+    int low_offset = 0, high_offset = 0, low_total = 0, high_total = 0;
+    for (int other = 0; other < NUM_WARPS; other++) {
+      low_offset += other < warp ? s_warp_low[other] : 0;
+      high_offset += other < warp ? s_warp_high[other] : 0;
+      low_total += s_warp_low[other];
+      high_total += s_warp_high[other];
+    }
+    if (low) {
+      head_sorted_positions[next_low + low_offset +
+                            __popc(low_mask & lanes_before)] = token_idx;
+    }
+    if (high) {
+      head_sorted_positions[next_high + high_offset +
+                            __popc(high_mask & lanes_before)] = token_idx;
+    }
+    next_low += low_total;
+    next_high += high_total;
+    __syncthreads();
   }
 }
 
-// Phase 2 of the prompt-phase writer: one warp per score-ordered token
+// Phase 2 of the prompt-phase writer: one warp per token in phase 1 order
 // quantizes and writes it to its high or low precision page slot, with
 // the same per-token arithmetic as the single-kernel writer.
 template <typename scalar_t, int HEAD_SIZE, int BITS_K_HIGH, int BITS_V_HIGH,
@@ -1728,12 +1552,7 @@ void compress_and_append_cache_prompt_phase(
   const int unified_page_size = kv_cache.size(1);
   TORCH_CHECK(unified_page_size == 3392, "Invalid DiffKV cache input");
 
-  const int max_prompt_len_power2 = POWER2_ROUND_UP_HOST(max_prompt_len);
-  const int shared_mem_size =
-      max_prompt_len_power2 * sizeof(float)  // s_mean_scores
-      + max_prompt_len_power2 * sizeof(int)  // s_positions
-      + max_prompt_len * sizeof(float);      // s_scores
-  // + max_prompt_len * sizeof(char);         // s_keep
+  const int shared_mem_size = max_prompt_len * sizeof(float);  // s_mean_scores
 
   size_t max_shared_mem_size =
       at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock;
