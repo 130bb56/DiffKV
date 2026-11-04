@@ -112,6 +112,7 @@ def get_extension(*, verbose: bool = False) -> ModuleType:
                 "attention/dequantize_prefix_kernels.cu",
                 "cache_kernels.cu",
                 "long_prompt_cache_kernels.cu",
+                "prompt_score_kernels.cu",
                 "mem_mgt_kernels.cu",
             )
         ],

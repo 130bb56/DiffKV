@@ -146,21 +146,51 @@ def _column_score_kernel(
         mask_m = (offs_m < len_q) & (offs_m >= first_scored)
         visible = (offs_m[:, None] + shift >= offs_n[None, :]) & mask_m[:, None]
         sum0 += _head_column_sum(
-            head_q, head_lse, keys_t, offs_m, offs_d, mask_m, visible, scale,
-            q_token_stride, lse_token_stride,
+            head_q,
+            head_lse,
+            keys_t,
+            offs_m,
+            offs_d,
+            mask_m,
+            visible,
+            scale,
+            q_token_stride,
+            lse_token_stride,
         )
         sum1 += _head_column_sum(
-            head_q + q_head_stride, head_lse + lse_head_stride, keys_t, offs_m,
-            offs_d, mask_m, visible, scale, q_token_stride, lse_token_stride,
+            head_q + q_head_stride,
+            head_lse + lse_head_stride,
+            keys_t,
+            offs_m,
+            offs_d,
+            mask_m,
+            visible,
+            scale,
+            q_token_stride,
+            lse_token_stride,
         )
         sum2 += _head_column_sum(
-            head_q + 2 * q_head_stride, head_lse + 2 * lse_head_stride, keys_t,
-            offs_m, offs_d, mask_m, visible, scale, q_token_stride,
+            head_q + 2 * q_head_stride,
+            head_lse + 2 * lse_head_stride,
+            keys_t,
+            offs_m,
+            offs_d,
+            mask_m,
+            visible,
+            scale,
+            q_token_stride,
             lse_token_stride,
         )
         sum3 += _head_column_sum(
-            head_q + 3 * q_head_stride, head_lse + 3 * lse_head_stride, keys_t,
-            offs_m, offs_d, mask_m, visible, scale, q_token_stride,
+            head_q + 3 * q_head_stride,
+            head_lse + 3 * lse_head_stride,
+            keys_t,
+            offs_m,
+            offs_d,
+            mask_m,
+            visible,
+            scale,
+            q_token_stride,
             lse_token_stride,
         )
     score = tl.maximum(tl.maximum(sum0, sum1), tl.maximum(sum2, sum3))
@@ -224,7 +254,9 @@ def _scatter_prefix_scores_kernel(
     )
     page_base = tl.where(is_high, high_page, low_page) * page_words
     slot = tl.where(is_high, offs % 32, low_token % 60)
-    score_address = page_base + tl.where(is_high, high_score_base, low_score_base) + slot
+    score_address = (
+        page_base + tl.where(is_high, high_score_base, low_score_base) + slot
+    )
     position_address = (
         page_base + tl.where(is_high, high_position_base, low_position_base) + slot
     )
@@ -340,7 +372,9 @@ def plan_chunk_prefill(
     if kv_len.shape[0] != num_requests or kv_len.shape[3] != 2:
         raise ValueError("kv_len_tables_cpu must be [requests, layers, kv_heads, 2]")
     num_layers, kv_heads = kv_len.shape[1], kv_len.shape[2]
-    chunk_slices = [(length + CHUNK_SLICE_TOKENS - 1) // CHUNK_SLICE_TOKENS for length in lengths]
+    chunk_slices = [
+        (length + CHUNK_SLICE_TOKENS - 1) // CHUNK_SLICE_TOKENS for length in lengths
+    ]
     layers = []
     for layer in range(num_layers):
         high = kv_len[:, layer, :, 0].tolist()
@@ -355,10 +389,14 @@ def plan_chunk_prefill(
                 pages = (high[r][g] + HIGH_PAGE_TOKENS - 1) // HIGH_PAGE_TOKENS
                 pages += (low[r][g] + LOW_PAGE_TOKENS - 1) // LOW_PAGE_TOKENS
                 slices = max(slices, pages + chunk_slices[r])
-        cu_k = torch.tensor([0] + seq_len_k, dtype=torch.int32).cumsum(0).to(torch.int32)
+        cu_k = (
+            torch.tensor([0] + seq_len_k, dtype=torch.int32).cumsum(0).to(torch.int32)
+        )
         chunk_rows = torch.cat(
             [
-                torch.arange(int(cu_k[s]) + prefix_list[s], int(cu_k[s + 1]), dtype=torch.int64)
+                torch.arange(
+                    int(cu_k[s]) + prefix_list[s], int(cu_k[s + 1]), dtype=torch.int64
+                )
                 for s in range(kv_heads * num_requests)
             ]
         )
@@ -420,7 +458,9 @@ def _direct_prefill(query, key, value, cu_seqlens, plan, scale, fa_version):
         fa_version=fa_version,
         return_softmax_lse=True,
     )
-    scores = torch.empty((plan.tokens, plan.kv_heads), dtype=torch.float32, device=query.device)
+    scores = torch.empty(
+        (plan.tokens, plan.kv_heads), dtype=torch.float32, device=query.device
+    )
     column_scores(
         query,
         key,
@@ -471,7 +511,9 @@ def chunk_prefill_attention(
     tokens, heads, _ = query.shape
     kv_heads = plan.kv_heads
     device = query.device
-    key_rows = torch.empty((layer.total_rows, 1, HEAD_SIZE), dtype=torch.float16, device=device)
+    key_rows = torch.empty(
+        (layer.total_rows, 1, HEAD_SIZE), dtype=torch.float16, device=device
+    )
     value_rows = torch.empty_like(key_rows)
     get_extension().ops.dequantize_prefix(
         plan.slot_ids,
@@ -548,7 +590,9 @@ def chunk_prefill_attention(
             SCORE_WINDOW=SCORE_WINDOW,
             BLOCK=256,
         )
-    chunk_scores = scores[layer.chunk_rows].view(kv_heads, tokens).transpose(0, 1).contiguous()
+    chunk_scores = (
+        scores[layer.chunk_rows].view(kv_heads, tokens).transpose(0, 1).contiguous()
+    )
     return output, chunk_scores, lse.transpose(0, 1)
 
 
@@ -574,32 +618,9 @@ def prompt_attention(query, key, value, cu_seqlens, max_seqlen, scale, out=None)
 
 def prompt_scores(query, key, lse, cu_seqlens, max_seqlen, scale):
     """Group-maximum token scores laid out [requests, KV heads, max_seqlen]."""
-    kv_heads = key.shape[1]
-    scores = torch.empty(
-        (cu_seqlens.numel() - 1, kv_heads, max_seqlen),
-        dtype=torch.float32,
-        device=query.device,
+    return get_extension().cache_ops.prompt_scores(
+        query, key, lse, cu_seqlens, max_seqlen, scale
     )
-    column_scores(
-        query,
-        key,
-        lse,
-        cu_seqlens,
-        cu_seqlens,
-        max_seqlen,
-        scale,
-        scores,
-        kv_heads=kv_heads,
-        q_head_stride=query.stride(1),
-        k_head_stride=key.stride(1),
-        k_seq_stride=0,
-        lse_head_stride=lse.stride(0),
-        lse_token_stride=lse.stride(1),
-        out_token_stride=scores.stride(2),
-        out_head_stride=scores.stride(1),
-        out_seq_stride=scores.stride(0),
-    )
-    return scores
 
 
 def compress_prompts(
@@ -649,23 +670,28 @@ def prompt_prefill(
     """Attention, scoring and compression of whole prompts, one launch each.
 
     Every request's prompt is complete in this step, so the keys are the
-    step's own activations. FA2 returns the log-sum-exp, the score kernel
-    turns it into per-token scores laid out [requests, KV heads, max_seqlen],
-    and one prompt-phase writer call compresses all requests into the cache.
-    key and value may be strided views; the writer reads their token stride.
+    step's own activations. FA2 returns the log-sum-exp; one extension call
+    turns it into per-token scores laid out [requests, KV heads, max_seqlen]
+    (prompt_scores) and compresses all requests into the cache with the
+    prompt-phase writer (compress_prompts). key and value may be strided
+    views; the kernels read their token stride.
     """
     out, lse = prompt_attention(query, key, value, cu_seqlens, max_seqlen, scale, out)
-    scores = prompt_scores(query, key, lse, cu_seqlens, max_seqlen, scale)
-    compress_prompts(
+    scores = get_extension().cache_ops.score_and_compress_prompts(
+        query,
         key,
         value,
-        scores,
+        lse,
         cu_seqlens,
+        max_seqlen,
+        scale,
         kv_cache,
         slot_ids,
         block_tables,
         kv_len_tables,
         compress_config_tables,
+        KV_BUFFER_SIZE,
         layer_idx,
+        *QUANT_ARGS,
     )
     return out, scores

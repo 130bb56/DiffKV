@@ -19,6 +19,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
             &compress_and_append_cache_long_prompt_phase);
   cache.def("compress_and_append_cache_decode_phase",
             &compress_and_append_cache_decode_phase);
+  cache.def("prompt_scores", &prompt_scores);
+  cache.def("score_and_compress_prompts", &score_and_compress_prompts);
   auto memory = module.def_submodule("mem_mgt_ops");
   memory.def("allocate_seqs", &allocate_seqs);
   memory.def("prepare_free_prompt", &prepare_free_prompt);
