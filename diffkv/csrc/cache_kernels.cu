@@ -1443,8 +1443,9 @@ void compress_and_append_cache_prompt_phase(
                   score.size(2) > 0 && seq_start_loc.dim() == 1 &&
                   seq_start_loc.numel() == slot_ids.numel() + 1,
               "Invalid prompt score or sequence-start shape");
-  TORCH_CHECK(score.size(1) == key.size(1) * 4,
-              "Prompt scores must have four query heads per KV head");
+  // Scores per query head (four per KV head) or already maximized per KV head.
+  TORCH_CHECK(score.size(1) == key.size(1) * 4 || score.size(1) == key.size(1),
+              "Prompt scores must have one or four heads per KV head");
 
   TORCH_CHECK(k_vec_size == K_VEC_SIZE, "k_vec_size should be ", K_VEC_SIZE);
   TORCH_CHECK(v_vec_size == V_VEC_SIZE, "v_vec_size should be ", V_VEC_SIZE);

@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from diffkv.ops import PAGE_SIZE, get_extension
+from diffkv.ops import PAGE_SIZE, QUANT_ARGS, get_extension
 
 HEAD_SIZE = 128
 QUERIES_PER_KV = 4
@@ -36,6 +36,8 @@ LOW_PAGE_TOKENS = 60
 # Only the last SCORE_WINDOW queries of a chunk score tokens, as the original
 # prompt kernel used the last NUM_TOKENS_SCORE prompt queries.
 SCORE_WINDOW = 64
+# Prompt-phase writers keep the last KV_BUFFER_SIZE tokens at high precision.
+KV_BUFFER_SIZE = 64
 # 32-bit word offsets of the score and position fields inside a 6784-byte
 # page (page_layout in benchmarks/attention/correctness.py, halved).
 HIGH_SCORE_BASE = 1600
@@ -89,9 +91,11 @@ def _column_score_kernel(
     lse_token_stride,
     out_token_stride,
     out_head_stride,
+    out_seq_stride,
     SCORE_WINDOW: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PACKED_OUT: tl.constexpr,
 ):
     """DiffKV prompt-phase score of every key token in a sequence.
 
@@ -99,7 +103,9 @@ def _column_score_kernel(
     over the last SCORE_WINDOW queries of the chunk that see the key; the
     token score is the maximum over the heads. Key j is visible to query i
     when j <= i + (len_k - len_q): the prefix fully, the chunk causally.
-    The key sequence index is kv_head * k_seq_stride + sequence.
+    The key sequence index is kv_head * k_seq_stride + sequence. With
+    PACKED_OUT the output is indexed by packed key token, otherwise by
+    sequence and the token's position within it.
     """
     sequence = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -158,8 +164,12 @@ def _column_score_kernel(
             lse_token_stride,
         )
     score = tl.maximum(tl.maximum(sum0, sum1), tl.maximum(sum2, sum3))
+    if PACKED_OUT:
+        out_ptr += k_start * out_token_stride
+    else:
+        out_ptr += sequence * out_seq_stride
     tl.store(
-        out_ptr + (k_start + offs_n) * out_token_stride + kv_head * out_head_stride,
+        out_ptr + offs_n * out_token_stride + kv_head * out_head_stride,
         score,
         mask=mask_n,
     )
@@ -242,6 +252,7 @@ def column_scores(
     lse_token_stride,
     out_token_stride,
     out_head_stride,
+    out_seq_stride=0,
     block_m=32,
     block_n=64,
 ):
@@ -263,9 +274,11 @@ def column_scores(
         lse_token_stride,
         out_token_stride,
         out_head_stride,
+        out_seq_stride,
         SCORE_WINDOW=SCORE_WINDOW,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        PACKED_OUT=out_seq_stride == 0,
         num_stages=1,
         num_warps=4,
     )
@@ -537,3 +550,83 @@ def chunk_prefill_attention(
         )
     chunk_scores = scores[layer.chunk_rows].view(kv_heads, tokens).transpose(0, 1).contiguous()
     return output, chunk_scores, lse.transpose(0, 1)
+
+
+def prompt_prefill(
+    query,
+    key,
+    value,
+    cu_seqlens,
+    max_seqlen,
+    scale,
+    kv_cache,
+    slot_ids,
+    block_tables,
+    kv_len_tables,
+    compress_config_tables,
+    layer_idx,
+    out=None,
+):
+    """Attention, scoring and compression of whole prompts, one launch each.
+
+    Every request's prompt is complete in this step, so the keys are the
+    step's own activations. FA2 returns the log-sum-exp, the score kernel
+    turns it into per-token scores laid out [requests, KV heads, max_seqlen],
+    and one prompt-phase writer call compresses all requests into the cache.
+    key and value may be strided views; the writer reads their token stride.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    kv_heads = key.shape[1]
+    out, lse = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        out=out,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=scale,
+        causal=True,
+        fa_version=2,
+        return_softmax_lse=True,
+    )
+    num_requests = cu_seqlens.numel() - 1
+    scores = torch.empty(
+        (num_requests, kv_heads, max_seqlen), dtype=torch.float32, device=query.device
+    )
+    column_scores(
+        query,
+        key,
+        lse,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        scale,
+        scores,
+        kv_heads=kv_heads,
+        q_head_stride=query.stride(1),
+        k_head_stride=key.stride(1),
+        k_seq_stride=0,
+        lse_head_stride=lse.stride(0),
+        lse_token_stride=lse.stride(1),
+        out_token_stride=scores.stride(2),
+        out_head_stride=scores.stride(1),
+        out_seq_stride=scores.stride(0),
+    )
+    get_extension().cache_ops.compress_and_append_cache_prompt_phase(
+        key,
+        value,
+        scores,
+        kv_cache,
+        slot_ids,
+        block_tables,
+        kv_len_tables,
+        cu_seqlens,
+        compress_config_tables,
+        KV_BUFFER_SIZE,
+        layer_idx,
+        *QUANT_ARGS,
+    )
+    return out, scores

@@ -411,6 +411,85 @@ def metadata(extension):
     }
 
 
+PREFILL_CASES = {
+    "one_prompt": (256,),
+    "mixed_lengths": (37, 256, 1024),
+    "kv_buffer_boundary": (63, 64, 65, 129),
+}
+
+
+def check_prefill(lengths, kv_heads=8):
+    """prompt_prefill against the backend prefill path on the same inputs.
+
+    Both paths start from freshly admitted requests. Attention output, the
+    group-maximum scores, retained lengths and every packed page of the layer
+    must agree.
+    """
+    from attention.benchmark_prefill import admit_requests, qkv_inputs, serving_prefill
+
+    from diffkv.prefill import prompt_prefill
+
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    reference, request_ids = admit_requests(lengths, kv_heads)
+    candidate, _ = admit_requests(lengths, kv_heads)
+    expected = serving_prefill(
+        reference,
+        request_ids,
+        starts.tolist(),
+        query,
+        key,
+        value,
+        torch.empty_like(query),
+    )
+    slots = candidate.metadata(request_ids).slot_ids
+    output, scores = prompt_prefill(
+        query,
+        key,
+        value,
+        starts.cuda(),
+        max(lengths),
+        SCALE,
+        candidate.kv_cache,
+        slots,
+        candidate.block_tables,
+        candidate.kv_len_tables,
+        candidate.compress_config_tables,
+        LAYER_IDX,
+    )
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    maximum_score_error = 0.0
+    for row, (req_id, length) in enumerate(zip(request_ids, lengths)):
+        sums = reference.prompt_scores(req_id)[LAYER_IDX]
+        group_max = sums.view(kv_heads, QUERY_HEADS_PER_KV, length).amax(dim=1)
+        torch.testing.assert_close(
+            scores[row, :, :length], group_max, atol=1e-6, rtol=1e-3
+        )
+        maximum_score_error = max(
+            maximum_score_error,
+            (scores[row, :, :length] - group_max).abs().max().item(),
+        )
+    slots = slots.long()
+    for name in ("block_tables", "kv_len_tables"):
+        if not torch.equal(
+            getattr(reference, name)[slots, LAYER_IDX],
+            getattr(candidate, name)[slots, LAYER_IDX],
+        ):
+            raise AssertionError(f"Prompt compression changed {name}")
+    pages = reference.block_tables[slots, LAYER_IDX]
+    pages = pages[pages >= 0].long()
+    differing = (
+        (reference.kv_cache[pages] != candidate.kv_cache[pages]).any(dim=1).sum()
+    )
+    if differing:
+        raise AssertionError(f"{differing.item()} packed pages differ")
+    return {
+        "output_max_abs_error": (output - expected).abs().max().item(),
+        "score_max_abs_error": maximum_score_error,
+        "packed_pages_compared": pages.numel(),
+    }
+
+
 def run_checks(extension):
     cases = {
         "partial_pages": ((33, 61), (95, 119)),
@@ -440,7 +519,16 @@ def run_checks(extension):
             raise AssertionError("Rejected dtype modified cache") from None
     else:
         raise AssertionError("Unsupported FP32 queries were accepted")
-    return {"status": "passed", "metadata": metadata(extension), "cases": results}
+    prefill = [
+        {"name": name, "lengths": lengths, **check_prefill(lengths)}
+        for name, lengths in PREFILL_CASES.items()
+    ]
+    return {
+        "status": "passed",
+        "metadata": metadata(extension),
+        "cases": results,
+        "prefill_cases": prefill,
+    }
 
 
 def main():

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Prefill attention latency for DiffKV chunked prefill and vLLM FA2 FP16, one
-# run per batch size. Prefix and chunk lengths come from benchmark_prefill.py
-# defaults unless DIFFKV_PREFIXES and DIFFKV_CHUNKS are set. The GPU SM clock
+# Prefill latency of one layer for whole prompts (chunked prefill off): current
+# DiffKV backend path, DiffKV prompt_prefill, vLLM FA2 FP16 and FlashInfer FP8,
+# one run per batch size. Prompt lengths come from benchmark_prefill.py
+# defaults (256 1024) unless DIFFKV_PROMPTS is set. The GPU SM clock
 # is locked to 1395 MHz and GPU telemetry is recorded.
 # Usage: run_prefill.sh [batch ...]   (default: 1 8 32)
 # Results: attention/logs/<UTC>-prefill-b<batch>/
@@ -18,13 +19,9 @@ fi
 gpu=${DIFFKV_GPU:-0}
 image=${DIFFKV_CONTAINER_IMAGE:-sha256:ca18e2f9134073dc2cc5d9899d7d9974e321008ecc4ab7745477eeb5508befe8}
 extra=()
-if [ -n "${DIFFKV_PREFIXES:-}" ]; then
+if [ -n "${DIFFKV_PROMPTS:-}" ]; then
   # shellcheck disable=SC2206
-  extra+=(--prefixes ${DIFFKV_PREFIXES})
-fi
-if [ -n "${DIFFKV_CHUNKS:-}" ]; then
-  # shellcheck disable=SC2206
-  extra+=(--chunks ${DIFFKV_CHUNKS})
+  extra+=(--prompts ${DIFFKV_PROMPTS})
 fi
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

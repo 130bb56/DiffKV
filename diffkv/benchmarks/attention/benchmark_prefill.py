@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare DiffKV chunked prefill attention with vLLM FA2 FP16 prefill.
+"""Prefill latency of one layer for whole prompts (chunked prefill off).
 
-One step holds `batch` prefill requests. Each has `prefix` retained tokens
-already in its cache and a `chunk` of new tokens. The DiffKV arm dequantizes
-the packed prefix of every (KV head, request) into FP16 rows, runs one FA2
-varlen call over prefix plus chunk, sums the attention probabilities per key
-token (the score proxy) and adds the prefix token scores into the cache pages.
-The FA2 arm writes the chunk K/V into a paged FP16 cache and runs FA2 over
-prefix plus chunk with a block table, as the vLLM FLASH_ATTN backend does.
-Prefix 0 is a prompt processed in one chunk. Packing, allocation and plan
-construction are untimed; no accuracy check is made here.
+One step holds `batch` requests whose prompts of `prompt` tokens are all
+processed in that step. Query, key and value are views of one QKV projection
+output, as the vLLM attention layer receives them. Every arm includes writing
+the prompt's KV into its cache:
+
+- diffkv_serving: the current DiffKV backend path (backend.py), per request:
+  copy KV into the raw prompt buffer, FA2, final-64 query scores with a matmul
+  and softmax per KV head, prompt-phase compression into the packed cache.
+- diffkv: diffkv.prefill.prompt_prefill, one FA2 varlen call returning the
+  log-sum-exp, one score kernel and one prompt-phase compression call.
+- fa2_fp16: reshape_and_cache_flash into a paged FP16 cache and paged FA2,
+  as the vLLM FLASH_ATTN backend does.
+- flashinfer_fp8: reshape_and_cache_flash into a paged fp8_e4m3 cache and the
+  FlashInfer paged prefill kernel with FP16 queries, as the vLLM FLASHINFER
+  backend does on SM86.
+
+Cache allocation, request admission and FlashInfer planning are untimed.
 """
 
 import argparse
@@ -19,139 +27,199 @@ import os
 import statistics
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
-from attention.benchmark_latency import (
-    BLOCK_SIZE,
-    Arm,
-    compact_device_inputs,
-    measure,
-    timing_backend,
-)
+from attention.benchmark_latency import BLOCK_SIZE, Arm, measure, timing_backend
 from attention.correctness import (
     HEAD_SIZE,
     LAYER_IDX,
-    PAGE_SIZE,
     SCALE,
-    build_fixture,
     default_run_dir,
     metadata,
 )
 
+QUERIES_PER_KV = 4
 
-def chunk_inputs(batch, chunk, kv_heads, seed=23):
+
+def qkv_inputs(lengths, kv_heads, seed=23):
+    """Query, key and value as strided views of one [tokens, QKV] tensor."""
     generator = torch.Generator().manual_seed(seed)
-    heads = kv_heads * 4
-    shape = (batch * chunk, heads, HEAD_SIZE)
-    query = (torch.randn(shape, generator=generator) * 0.12).half().cuda()
-    key = (torch.randn((batch * chunk, kv_heads, HEAD_SIZE), generator=generator) * 0.5)
-    value = torch.randn((batch * chunk, kv_heads, HEAD_SIZE), generator=generator) * 0.5
-    starts = torch.arange(batch + 1, dtype=torch.int32) * chunk
-    return query, key.half().cuda(), value.half().cuda(), starts
-
-
-def packed_prefix(batch, prefix, kv_heads, high_fraction):
-    """Packed cache tables for the prefix; empty tables when prefix is 0."""
-    if prefix == 0:
-        slots = max(4, batch + 2)
-        tables = torch.zeros((slots, 2, kv_heads, 4), dtype=torch.int32).cuda()
-        lengths = torch.zeros((slots, 2, kv_heads, 2), dtype=torch.int32).cuda()
-        cache = torch.zeros((1, PAGE_SIZE), dtype=torch.int16).cuda()
-        slot_ids = list(range(batch))
-        return cache, tables, lengths, slot_ids, None, 0
-    high = round(prefix * high_fraction)
-    fixture = build_fixture(
-        ((high, prefix - high),) * batch,
-        kv_heads=kv_heads,
-        uniform_head_lengths=True,
-        compute_reference=False,
-    )
-    inputs = compact_device_inputs(fixture)
-    cache_bytes = inputs["kv_cache"].numel() * inputs["kv_cache"].element_size()
-    slot_ids = fixture.slot_ids.tolist()
+    heads = kv_heads * QUERIES_PER_KV
+    tokens = sum(lengths)
+    q_size = heads * HEAD_SIZE
+    kv_size = kv_heads * HEAD_SIZE
+    qkv = torch.empty((tokens, q_size + 2 * kv_size), dtype=torch.float16)
+    qkv[:, :q_size] = torch.randn((tokens, q_size), generator=generator) * 0.12
+    qkv[:, q_size:] = torch.randn((tokens, 2 * kv_size), generator=generator) * 0.5
+    qkv = qkv.cuda()
+    query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    starts = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0, dtype=torch.int32)
     return (
-        inputs["kv_cache"],
-        inputs["block_tables"],
-        inputs["kv_len_tables"],
-        slot_ids,
-        fixture.kv_len_tables[slot_ids],
-        cache_bytes,
+        query.view(tokens, heads, HEAD_SIZE),
+        key.view(tokens, kv_heads, HEAD_SIZE),
+        value.view(tokens, kv_heads, HEAD_SIZE),
+        starts,
     )
 
 
-def make_diffkv(batch, prefix, chunk, kv_heads, high_fraction):
-    from diffkv.prefill import chunk_prefill_attention, plan_chunk_prefill
+def admit_requests(lengths, kv_heads):
+    """A cache controller with one admitted prompt per length, at prefill start."""
+    from diffkv.cache import DiffKVCacheController
+    from diffkv.ops import PAGE_BYTES, PAGE_SIZE
 
-    query, key, value, starts = chunk_inputs(batch, chunk, kv_heads)
-    cache, tables, lengths, slot_ids, lengths_cpu, cache_bytes = packed_prefix(
-        batch, prefix, kv_heads, high_fraction
+    num_layers = LAYER_IDX + 1
+    num_kv_caches = num_layers * kv_heads
+    pages = 16
+    for prompt in lengths:
+        pages += (-(-prompt // 32) + 1) * num_kv_caches
+        pages += -(-prompt * num_kv_caches * (HEAD_SIZE * 2 * 2 + 4 * 4) // PAGE_BYTES)
+    controller = DiffKVCacheController(
+        max_num_requests=len(lengths),
+        num_layers=num_layers,
+        num_kv_heads=kv_heads,
+        max_model_len=max(lengths),
+        arena=torch.zeros((pages, PAGE_SIZE), dtype=torch.int16, device="cuda"),
     )
-    plan = plan_chunk_prefill(
-        starts.tolist(), slot_ids, lengths_cpu, "cuda", kv_heads=kv_heads
-    )
-    cu_seqlens = starts.cuda()
+    request_ids = [f"r{index}" for index in range(len(lengths))]
+    for request_id, prompt in zip(request_ids, lengths):
+        controller.begin_request(request_id, prompt)
+    return controller, request_ids
+
+
+def serving_prefill(controller, request_ids, starts, query, key, value, output):
+    """The DiffKV backend prefill of one layer, prompts complete in this step.
+
+    Mirrors DiffKVImpl.forward for prefill requests with prefix_start 0,
+    including the score reset that begin_request performs.
+    """
+    from diffkv.backend import DiffKVImpl, accumulate_prompt_scores, causal_prefill
+
+    impl = SimpleNamespace(num_kv_heads=key.shape[1])
+    for row, req_id in enumerate(request_ids):
+        start, end = starts[row], starts[row + 1]
+        raw = controller.raw_prompt(req_id)[LAYER_IDX]
+        raw[0].copy_(key[start:end])
+        raw[1].copy_(value[start:end])
+        output[start:end].copy_(causal_prefill(query[start:end], raw[0], raw[1], SCALE))
+        scores = controller.prompt_scores(req_id)[LAYER_IDX]
+        scores.zero_()
+        accumulate_prompt_scores(
+            scores, query[start:end], raw[0], 0, end - start, SCALE
+        )
+        DiffKVImpl._compress_prompt(impl, controller, req_id, LAYER_IDX, raw, scores)
+    return output
+
+
+def cache_bytes(controller):
+    return controller.kv_cache.numel() * controller.kv_cache.element_size()
+
+
+def make_diffkv_serving(batch, prompt, kv_heads):
+    lengths = [prompt] * batch
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    controller, request_ids = admit_requests(lengths, kv_heads)
+    output = torch.empty_like(query)
+    bounds = starts.tolist()
 
     def run(q, k, v):
-        return chunk_prefill_attention(
-            q, k, v, cu_seqlens, plan, cache, tables, lengths, LAYER_IDX, SCALE
-        )
+        serving_prefill(controller, request_ids, bounds, q, k, v, output)
 
-    output, scores, lse = run(query, key, value)
+    run(query, key, value)
     return Arm(
         run,
         (query, key, value),
         output,
-        cache_bytes,
+        cache_bytes(controller),
         {
             "backend": "DIFFKV",
+            "path": "diffkv.backend (DiffKVImpl.forward prefill branch)",
             "parts": [
-                "query regroup copy and chunk K/V copy into the sequence rows",
-                "packed prefix dequantization to FP16 rows (CUDA)",
-                "FA2 varlen over (KV head, request) sequences with log-sum-exp",
-                "column score kernel (Triton)",
-                "prefix score scatter into pages (Triton atomic add)",
-                "output regroup copy",
-            ]
-            if prefix > 0
-            else [
-                "FA2 over the chunk with log-sum-exp",
-                "column score kernel (Triton)",
+                "per request: key and value copy into the raw prompt buffer",
+                "per request: FA2 (causal_prefill)",
+                "per request: final-64 query scores, matmul and softmax per KV "
+                "head (accumulate_prompt_scores)",
+                "per request: compress_and_append_cache_prompt_phase",
             ],
-            "prefix_score_update_included": prefix > 0,
-            "chunk_scores_shape": list(scores.shape),
-            "lse_shape": list(lse.shape),
         },
         {},
     )
 
 
-def make_fa2(batch, prefix, chunk, kv_heads):
-    from vllm import _custom_ops
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
+def make_diffkv(batch, prompt, kv_heads):
+    from diffkv.prefill import prompt_prefill
 
-    query, key, value, starts = chunk_inputs(batch, chunk, kv_heads)
-    total = prefix + chunk
-    pages_per_request = (total + BLOCK_SIZE - 1) // BLOCK_SIZE
+    lengths = [prompt] * batch
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    controller, request_ids = admit_requests(lengths, kv_heads)
+    slot_ids = controller.metadata(request_ids).slot_ids
+    cu_seqlens = starts.cuda()
+    output = torch.empty_like(query)
+
+    def run(q, k, v):
+        prompt_prefill(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            prompt,
+            SCALE,
+            controller.kv_cache,
+            slot_ids,
+            controller.block_tables,
+            controller.kv_len_tables,
+            controller.compress_config_tables,
+            LAYER_IDX,
+            out=output,
+        )
+
+    run(query, key, value)
+    return Arm(
+        run,
+        (query, key, value),
+        output,
+        cache_bytes(controller),
+        {
+            "backend": "DIFFKV",
+            "path": "diffkv.prefill.prompt_prefill",
+            "parts": [
+                "FA2 varlen over all requests with log-sum-exp",
+                "column score kernel (Triton), scores [requests, KV heads, prompt]",
+                "compress_and_append_cache_prompt_phase for all requests",
+            ],
+        },
+        {},
+    )
+
+
+def paged_layout(batch, prompt):
+    pages_per_request = -(-prompt // BLOCK_SIZE)
     pages = batch * pages_per_request
-    generator = torch.Generator().manual_seed(29)
-    key_cache = (
-        torch.randn((pages, BLOCK_SIZE, kv_heads, HEAD_SIZE), generator=generator) * 0.5
-    ).half().cuda()
-    value_cache = (
-        torch.randn((pages, BLOCK_SIZE, kv_heads, HEAD_SIZE), generator=generator) * 0.5
-    ).half().cuda()
     tables = torch.arange(pages, dtype=torch.int32, device="cuda").reshape(
         batch, pages_per_request
     )
     slots = torch.cat(
         [
-            torch.arange(prefix, total, dtype=torch.int64)
+            torch.arange(prompt, dtype=torch.int64)
             + request * pages_per_request * BLOCK_SIZE
             for request in range(batch)
         ]
     ).cuda()
+    return pages_per_request, pages, tables, slots
+
+
+def make_fa2(batch, prompt, kv_heads):
+    from vllm import _custom_ops
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    lengths = [prompt] * batch
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    _, pages, tables, slots = paged_layout(batch, prompt)
+    shape = (pages, BLOCK_SIZE, kv_heads, HEAD_SIZE)
+    key_cache = torch.zeros(shape, dtype=torch.float16, device="cuda")
+    value_cache = torch.zeros_like(key_cache)
     cu_seqlens_q = starts.cuda()
-    seqused_k = torch.full((batch,), total, dtype=torch.int32, device="cuda")
+    seqused_k = torch.full((batch,), prompt, dtype=torch.int32, device="cuda")
     output = torch.empty_like(query)
     scales = torch.ones((), dtype=torch.float32, device="cuda")
 
@@ -165,8 +233,8 @@ def make_fa2(batch, prefix, chunk, kv_heads):
             v=value_cache,
             out=output,
             cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=chunk,
-            max_seqlen_k=total,
+            max_seqlen_q=prompt,
+            max_seqlen_k=prompt,
             seqused_k=seqused_k,
             block_table=tables,
             softmax_scale=SCALE,
@@ -184,20 +252,101 @@ def make_fa2(batch, prefix, chunk, kv_heads):
             "backend": "FLASH_ATTN",
             "fa_version": 2,
             "cache_dtype": "float16",
-            "parts": ["reshape_and_cache_flash for the chunk", "FA2 varlen, paged KV"],
+            "parts": ["reshape_and_cache_flash", "FA2 varlen, paged KV"],
             "page_tokens": BLOCK_SIZE,
         },
         {},
     )
 
 
+def make_fp8(batch, prompt, kv_heads):
+    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+    from vllm import _custom_ops
+
+    lengths = [prompt] * batch
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    pages_per_request, pages, _, slots = paged_layout(batch, prompt)
+    # The serving baseline resolves the LBNHC layout, exposed to FlashInfer as NHD.
+    arena = torch.zeros(
+        (pages, BLOCK_SIZE, kv_heads, 2 * HEAD_SIZE),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    key_cache, value_cache = arena.split(HEAD_SIZE, dim=-1)
+    scales = torch.ones((), dtype=torch.float32, device="cuda")
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+    wrapper.plan(
+        qo_indptr=starts,
+        paged_kv_indptr=torch.arange(batch + 1, dtype=torch.int32)
+        * pages_per_request,
+        paged_kv_indices=torch.arange(pages, dtype=torch.int32, device="cuda"),
+        paged_kv_last_page_len=torch.full(
+            (batch,), (prompt - 1) % BLOCK_SIZE + 1, dtype=torch.int32
+        ),
+        num_qo_heads=query.shape[1],
+        num_kv_heads=kv_heads,
+        head_dim_qk=HEAD_SIZE,
+        page_size=BLOCK_SIZE,
+        causal=True,
+        sm_scale=SCALE,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.float16,
+    )
+    output = torch.empty_like(query)
+
+    def run(q, k, v):
+        _custom_ops.reshape_and_cache_flash(
+            k, v, key_cache, value_cache, slots, "fp8_e4m3", scales, scales
+        )
+        wrapper.run(
+            q,
+            (key_cache, value_cache),
+            q_scale=1.0,
+            k_scale=1.0,
+            v_scale=1.0,
+            out=output,
+        )
+
+    run(query, key, value)
+    return Arm(
+        run,
+        (query, key, value),
+        output,
+        arena.numel() * arena.element_size(),
+        {
+            "backend": "FLASHINFER",
+            "cache_dtype": "fp8_e4m3",
+            "query_dtype": "float16",
+            "parts": [
+                "reshape_and_cache_flash (fp8_e4m3)",
+                "BatchPrefillWithPagedKVCacheWrapper, causal, paged KV",
+            ],
+            "flashinfer_resolved_backend": wrapper._backend,
+            "scale_handling": "per-tensor key and value scale 1.0, no calibration",
+            "page_tokens": BLOCK_SIZE,
+        },
+        {},
+    )
+
+
+ARMS = {
+    "diffkv_serving": make_diffkv_serving,
+    "diffkv": make_diffkv,
+    "fa2_fp16": make_fa2,
+    "flashinfer_fp8": make_fp8,
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--prefixes", type=int, nargs="+", default=[0, 2048])
-    parser.add_argument("--chunks", type=int, nargs="+", default=[256, 1024])
+    parser.add_argument("--prompts", type=int, nargs="+", default=[256, 1024])
     parser.add_argument("--kv-heads", type=int, default=8)
-    parser.add_argument("--high-fraction", type=float, default=0.25)
     parser.add_argument("--repeat-ms", type=int, default=500)
     parser.add_argument(
         "--output", type=Path, help="default: logs/<UTC>-prefill-b<batch>/latency.json"
@@ -205,12 +354,8 @@ def main():
     args = parser.parse_args()
     if args.output is None:
         args.output = default_run_dir(f"prefill-b{args.batch}") / "latency.json"
-    if min(args.batch, args.kv_heads, args.repeat_ms, *args.chunks) < 1:
-        parser.error("Batch, heads, repeat-ms and chunk lengths must be positive")
-    if min(args.prefixes) < 0:
-        parser.error("Prefix lengths must be nonnegative")
-    if not 0 <= args.high_fraction <= 1:
-        parser.error("high-fraction must lie in [0,1]")
+    if min(args.batch, args.kv_heads, args.repeat_ms, *args.prompts) < 1:
+        parser.error("Batch, heads, repeat-ms and prompt lengths must be positive")
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
 
@@ -219,30 +364,21 @@ def main():
     torch.set_num_threads(2)
     extension = get_extension()
     rows = []
-    for prefix in args.prefixes:
-        for chunk in args.chunks:
-            arms = {
-                "diffkv": make_diffkv(
-                    args.batch, prefix, chunk, args.kv_heads, args.high_fraction
-                ),
-                "fa2_fp16": make_fa2(args.batch, prefix, chunk, args.kv_heads),
-            }
-            samples = {name: [] for name in arms}
-            order = list(arms)
-            for name in [*order, *reversed(order)]:
-                arm = arms[name]
-                samples[name].extend(
-                    measure(arm.function, arm.arguments, args.repeat_ms)
-                )
-            medians = {
-                name: statistics.median(values) for name, values in samples.items()
-            }
-            row = {
+    for prompt in args.prompts:
+        arms = {
+            name: make(args.batch, prompt, args.kv_heads) for name, make in ARMS.items()
+        }
+        samples = {name: [] for name in arms}
+        order = list(arms)
+        for name in [*order, *reversed(order)]:
+            arm = arms[name]
+            samples[name].extend(measure(arm.function, arm.arguments, args.repeat_ms))
+        medians = {name: statistics.median(values) for name, values in samples.items()}
+        rows.append(
+            {
                 "batch": args.batch,
-                "prefix": prefix,
-                "chunk": chunk,
+                "prompt": prompt,
                 "kv_heads": args.kv_heads,
-                "high_fraction": args.high_fraction,
                 "cuda_graph": False,
                 "arms": {
                     name: {
@@ -253,15 +389,12 @@ def main():
                     }
                     for name, arm in arms.items()
                 },
-                "fa2_over_diffkv_ratio": medians["fa2_fp16"] / medians["diffkv"],
+                "diffkv_over_fp8_ratio": medians["diffkv"] / medians["flashinfer_fp8"],
             }
-            rows.append(row)
-            print(
-                json.dumps({"prefix": prefix, "chunk": chunk, "median_us": medians}),
-                flush=True,
-            )
-            del arms
-            torch.cuda.empty_cache()
+        )
+        print(json.dumps({"prompt": prompt, "median_us": medians}), flush=True)
+        del arms
+        torch.cuda.empty_cache()
     report = {
         "status": "completed",
         "metadata": metadata(extension),
@@ -273,15 +406,15 @@ def main():
         "timing_scope": "CUDA events around a direct eager call; L2 flush excluded; "
         "host launch gaps within the event interval are included",
         "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
-        "operation": "DiffKV chunked prefill attention (FA2 chunk, packed prefix "
-        "rows, merge, chunk scores) versus paged FA2 FP16 prefill with cache write",
-        "comparison_scope": "attention of one layer for one step; no compression, "
-        "no accuracy check, no serving claim",
+        "flashinfer_extra_cudaflags": os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS"),
+        "operation": "prefill of one layer for whole prompts (chunked prefill "
+        "off): attention plus writing the prompt KV into each arm's cache",
+        "comparison_scope": "one layer for one step; no accuracy check here "
+        "(correctness.py checks diffkv against diffkv_serving)",
         "excluded": [
-            "cache compression and append",
-            "packing",
-            "allocation",
-            "plan construction",
+            "cache allocation",
+            "request admission",
+            "FlashInfer plan",
             "compilation",
             "input generation",
         ],
