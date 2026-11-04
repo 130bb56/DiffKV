@@ -45,16 +45,31 @@ from attention.correctness import (
 QUERIES_PER_KV = 4
 
 
-def qkv_inputs(lengths, kv_heads, seed=23):
-    """Query, key and value as strided views of one [tokens, QKV] tensor."""
+def qkv_inputs(lengths, kv_heads, seed=23, query_scale=0.12, aligned=0.0):
+    """Query, key and value as strided views of one [tokens, QKV] tensor.
+
+    With `aligned` > 0, every query of a KV head group gets `aligned` times a
+    shared direction and every key a random multiple of it, so a key's logit
+    carries a per-token offset of about aligned**2 standard deviations for
+    all queries alike; tokens with a negative offset score low everywhere.
+    """
     generator = torch.Generator().manual_seed(seed)
     heads = kv_heads * QUERIES_PER_KV
     tokens = sum(lengths)
     q_size = heads * HEAD_SIZE
     kv_size = kv_heads * HEAD_SIZE
     qkv = torch.empty((tokens, q_size + 2 * kv_size), dtype=torch.float16)
-    qkv[:, :q_size] = torch.randn((tokens, q_size), generator=generator) * 0.12
-    qkv[:, q_size:] = torch.randn((tokens, 2 * kv_size), generator=generator) * 0.5
+    query = torch.randn((tokens, q_size), generator=generator) * query_scale
+    key_value = torch.randn((tokens, 2 * kv_size), generator=generator) * 0.5
+    if aligned:
+        direction = torch.randn((kv_heads, 1, HEAD_SIZE), generator=generator)
+        offsets = torch.randn((tokens, kv_heads, 1), generator=generator)
+        query += (aligned * direction).expand(-1, QUERIES_PER_KV, -1).reshape(-1)
+        key_value[:, :kv_size] += (
+            aligned * offsets * direction.squeeze(1) / HEAD_SIZE**0.5
+        ).reshape(tokens, kv_size)
+    qkv[:, :q_size] = query
+    qkv[:, q_size:] = key_value
     qkv = qkv.cuda()
     query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
     starts = torch.tensor([0, *lengths], dtype=torch.int32).cumsum(0, dtype=torch.int32)

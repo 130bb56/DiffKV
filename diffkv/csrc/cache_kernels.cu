@@ -25,12 +25,15 @@
 #define NUM_TOKENS_SCORE 64
 
 namespace diffkv {
+// Phase 1 of the prompt-phase writer: one block per (KV head, sequence)
+// computes mean scores, the pruned and quantized counts and the score
+// order, writes the retained lengths and stores the sorted positions.
 template <typename scalar_t, int HEAD_SIZE, int BITS_K_HIGH, int BITS_V_HIGH,
           int BITS_K_LOW, int BITS_V_LOW, int CHUNKS_K_HIGH, int CHUNKS_V_HIGH,
           int CHUNKS_K_LOW, int CHUNKS_V_LOW, int NUM_TOKENS_PER_PAGE_HIGH,
           int NUM_TOKENS_PER_PAGE_LOW,
           int THREAD_GROUP_SIZE_V>
-__global__ void compress_and_append_cache_prompt_phase_kernel(
+__global__ void select_prompt_tokens_kernel(
     const scalar_t* __restrict__ key,    // [total_num_tokens, num_kv_heads,
                                          // head_size]
     const scalar_t* __restrict__ value,  // [total_num_tokens, num_kv_heads,
@@ -44,6 +47,8 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
     int* __restrict__ kv_len_tables,  // [num_slots, num_layers, num_kv_heads,
                                       // 2]
     const int* __restrict__ seq_start_loc,             // [num_seqs + 1]
+    int* __restrict__ sorted_positions,  // [num_seqs, num_kv_heads,
+                                         // max_prompt_len]
     const float* __restrict__ compress_config_tables,  // [num_slots, 2]
     const int max_prompt_len, const int kv_buffer_size, const int layer_idx,
     const int kv_stride, const int num_layers, const int num_heads,
@@ -329,6 +334,197 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
   }
   __syncthreads();
 
+  int* head_sorted_positions =
+      sorted_positions +
+      (static_cast<int64_t>(seq_idx) * num_kv_heads + kv_head_idx) *
+          max_prompt_len;
+  for (int token_idx = thread_idx; token_idx < prompt_len;
+       token_idx += NUM_THREADS_PROMPT) {
+    head_sorted_positions[token_idx] = s_positions[token_idx];
+  }
+}
+
+// Phase 2 of the prompt-phase writer: one warp per score-ordered token
+// quantizes and writes it to its high or low precision page slot, with
+// the same per-token arithmetic as the single-kernel writer.
+template <typename scalar_t, int HEAD_SIZE, int BITS_K_HIGH, int BITS_V_HIGH,
+          int BITS_K_LOW, int BITS_V_LOW, int CHUNKS_K_HIGH, int CHUNKS_V_HIGH,
+          int CHUNKS_K_LOW, int CHUNKS_V_LOW, int NUM_TOKENS_PER_PAGE_HIGH,
+          int NUM_TOKENS_PER_PAGE_LOW,
+          int THREAD_GROUP_SIZE_V>
+__global__ void write_prompt_tokens_kernel(
+    const scalar_t* __restrict__ key,    // [total_num_tokens, num_kv_heads,
+                                         // head_size]
+    const scalar_t* __restrict__ value,  // [total_num_tokens, num_kv_heads,
+                                         // head_size]
+    const float* __restrict__ score,   // [num_seqs, num_heads, max_prompt_len]
+    uint16_t* __restrict__ kv_cache,   // [num_blocks, unified_page_size]
+    const int* __restrict__ slot_ids,  // [num_seqs]
+    const int* __restrict__ block_tables,  // [num_slots, num_layers,
+                                           // num_kv_heads,
+                                           // max_num_blocks_per_seq]
+    const int* __restrict__ kv_len_tables,  // [num_slots, num_layers,
+                                            // num_kv_heads, 2]
+    const int* __restrict__ seq_start_loc,     // [num_seqs + 1]
+    const int* __restrict__ sorted_positions,  // [num_seqs, num_kv_heads,
+                                               // max_prompt_len]
+    const int max_prompt_len, const int layer_idx, const int kv_stride,
+    const int num_layers, const int num_heads, const int num_kv_heads,
+    const int unified_page_size, const int max_num_blocks_per_seq) {
+  const int seq_idx = blockIdx.y;
+  const int slot_idx = slot_ids[seq_idx];
+  const int kv_head_idx = blockIdx.x;
+  const int num_queries_per_kv = num_heads / num_kv_heads;
+  // One warp per token: lanes split the head dimension and the packs.
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int token_idx =
+      blockIdx.z * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+
+  const int prompt_start = seq_start_loc[seq_idx];
+  const int prompt_end = seq_start_loc[seq_idx + 1];
+  const int prompt_len = prompt_end - prompt_start;
+
+  const float range_k_high = get_quant_range(BITS_K_HIGH);
+  const float range_v_high = get_quant_range(BITS_V_HIGH);
+  const float range_k_low = get_quant_range(BITS_K_LOW);
+  const float range_v_low = get_quant_range(BITS_V_LOW);
+
+  constexpr int K_PACK_SIZE_HIGH = 16 / BITS_K_HIGH;
+  constexpr int V_PACK_SIZE_HIGH = 16 / BITS_V_HIGH;
+  constexpr int K_PACK_SIZE_LOW = 16 / BITS_K_LOW;
+  constexpr int V_PACK_SIZE_LOW = 16 / BITS_V_LOW;
+
+  constexpr int NUM_K_PACKS_HIGH = HEAD_SIZE / K_PACK_SIZE_HIGH;
+  constexpr int NUM_V_PACKS_HIGH = HEAD_SIZE / V_PACK_SIZE_HIGH;
+  constexpr int NUM_K_PACKS_LOW = HEAD_SIZE / K_PACK_SIZE_LOW;
+  constexpr int NUM_V_PACKS_LOW = HEAD_SIZE / V_PACK_SIZE_LOW;
+
+  constexpr int NUM_K_VECS_HIGH = NUM_K_PACKS_HIGH / K_VEC_SIZE;
+  constexpr int NUM_K_VECS_LOW = NUM_K_PACKS_LOW / K_VEC_SIZE;
+  constexpr int NUM_VECS_PER_THREAD_K_HIGH =
+      NUM_K_VECS_HIGH / THREAD_GROUP_SIZE_K;
+  constexpr int NUM_VECS_PER_THREAD_K_LOW =
+      NUM_K_VECS_LOW / THREAD_GROUP_SIZE_K;
+
+  constexpr int CHUNK_SIZE_K_HIGH = HEAD_SIZE / CHUNKS_K_HIGH;
+  constexpr int CHUNK_SIZE_V_HIGH = HEAD_SIZE / CHUNKS_V_HIGH;
+  constexpr int CHUNK_SIZE_K_LOW = HEAD_SIZE / CHUNKS_K_LOW;
+  constexpr int CHUNK_SIZE_V_LOW = HEAD_SIZE / CHUNKS_V_LOW;
+
+  constexpr int NUM_K_PACKS_HIGH_PER_GROUP = NUM_K_PACKS_HIGH / CHUNKS_K_HIGH;
+  constexpr int NUM_V_PACKS_HIGH_PER_GROUP = NUM_V_PACKS_HIGH / CHUNKS_V_HIGH;
+  constexpr int NUM_K_PACKS_LOW_PER_GROUP = NUM_K_PACKS_LOW / CHUNKS_K_LOW;
+  constexpr int NUM_V_PACKS_LOW_PER_GROUP = NUM_V_PACKS_LOW / CHUNKS_V_LOW;
+
+  // for mod operations
+  constexpr int LOG2_NUM_VECS_PER_THREAD_K_HIGH =
+      log2_of_pow2(NUM_VECS_PER_THREAD_K_HIGH);
+  constexpr int LOG2_NUM_VECS_PER_THREAD_K_LOW =
+      log2_of_pow2(NUM_VECS_PER_THREAD_K_LOW);
+  static_assert(LOG2_NUM_VECS_PER_THREAD_K_HIGH > 0);
+  static_assert(LOG2_NUM_VECS_PER_THREAD_K_LOW > 0);
+
+  static_assert(NUM_K_PACKS_HIGH % K_VEC_SIZE == 0);
+  static_assert(NUM_K_PACKS_LOW % K_VEC_SIZE == 0);
+  static_assert(NUM_K_VECS_HIGH % THREAD_GROUP_SIZE_K == 0);
+  static_assert(NUM_K_VECS_LOW % THREAD_GROUP_SIZE_K == 0);
+
+  constexpr int NUM_PACKS_PER_THREAD_V_HIGH =
+      NUM_V_PACKS_HIGH / THREAD_GROUP_SIZE_V;
+  constexpr int NUM_PACKS_PER_THREAD_V_LOW =
+      NUM_V_PACKS_LOW / THREAD_GROUP_SIZE_V;
+
+  // for mod operations
+  constexpr int LOG2_NUM_PACKS_PER_THREAD_V_HIGH =
+      log2_of_pow2(NUM_PACKS_PER_THREAD_V_HIGH);
+  constexpr int LOG2_NUM_PACKS_PER_THREAD_V_LOW =
+      log2_of_pow2(NUM_PACKS_PER_THREAD_V_LOW);
+  static_assert(LOG2_NUM_PACKS_PER_THREAD_V_HIGH >= 0);
+  static_assert(LOG2_NUM_PACKS_PER_THREAD_V_LOW >= 0);
+
+  static_assert(NUM_V_PACKS_HIGH % THREAD_GROUP_SIZE_V == 0);
+  static_assert(NUM_V_PACKS_LOW % THREAD_GROUP_SIZE_V == 0);
+
+  // Align the starting address of each segment (key, key meta, val, val meta,
+  // score, pos) to 32 bytes.
+  constexpr int KEY_BASE_HIGH = 0;
+  constexpr int KEY_META_BASE_HIGH =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * NUM_K_PACKS_HIGH * 2, 32) *
+          32 / sizeof(uint16_t) +
+      KEY_BASE_HIGH;
+  constexpr int VAL_BASE_HIGH =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * 4 * CHUNKS_K_HIGH +
+                          KEY_META_BASE_HIGH * sizeof(uint16_t),
+                      128) *
+      128 / sizeof(uint16_t);
+  constexpr int PADDED_NUM_TOKENS_PER_PAGE_HIGH =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH, V_VEC_SIZE) * V_VEC_SIZE;
+  constexpr int VAL_META_BASE_HIGH =
+      DIVIDE_ROUND_UP(PADDED_NUM_TOKENS_PER_PAGE_HIGH * NUM_V_PACKS_HIGH * 2,
+                      32) *
+          32 / sizeof(uint16_t) +
+      VAL_BASE_HIGH;
+  constexpr int SCORE_BASE_HIGH =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_HIGH * 4 * CHUNKS_V_HIGH, 32) * 32 /
+          sizeof(uint16_t) +
+      VAL_META_BASE_HIGH;
+  constexpr int POSITION_BASE_HIGH =
+      NUM_TOKENS_PER_PAGE_HIGH * 4 / sizeof(uint16_t) + SCORE_BASE_HIGH;
+
+  constexpr int KEY_BASE_LOW = 0;
+  constexpr int KEY_META_BASE_LOW =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * NUM_K_PACKS_LOW * 2, 32) * 32 /
+          sizeof(uint16_t) +
+      KEY_BASE_LOW;
+  constexpr int VAL_BASE_LOW =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * 4 * CHUNKS_K_LOW +
+                          KEY_META_BASE_LOW * sizeof(uint16_t),
+                      128) *
+      128 / sizeof(uint16_t);
+  constexpr int PADDED_NUM_TOKENS_PER_PAGE_LOW =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW, V_VEC_SIZE) * V_VEC_SIZE;
+  constexpr int VAL_META_BASE_LOW =
+      DIVIDE_ROUND_UP(PADDED_NUM_TOKENS_PER_PAGE_LOW * NUM_V_PACKS_LOW * 2,
+                      32) *
+          32 / sizeof(uint16_t) +
+      VAL_BASE_LOW;
+  constexpr int SCORE_BASE_LOW =
+      DIVIDE_ROUND_UP(NUM_TOKENS_PER_PAGE_LOW * 4 * CHUNKS_V_LOW, 32) * 32 /
+          sizeof(uint16_t) +
+      VAL_META_BASE_LOW;
+  constexpr int POSITION_BASE_LOW =
+      NUM_TOKENS_PER_PAGE_LOW * 4 / sizeof(uint16_t) + SCORE_BASE_LOW;
+
+  // make sure that each key vec only corresponds to one group of metadata
+  static_assert(NUM_K_PACKS_HIGH % (K_VEC_SIZE * CHUNKS_K_HIGH) == 0);
+  static_assert(NUM_K_PACKS_LOW % (K_VEC_SIZE * CHUNKS_K_LOW) == 0);
+
+  if (token_idx >= prompt_len) {
+    return;
+  }
+  const int kv_len_tables_offset = slot_idx * num_layers * num_kv_heads * 2 +
+                                   layer_idx * num_kv_heads * 2 +
+                                   kv_head_idx * 2;
+  const int count_quantized = kv_len_tables[kv_len_tables_offset + 1];
+  const int count_pruned =
+      prompt_len - kv_len_tables[kv_len_tables_offset] - count_quantized;
+  if (token_idx < count_pruned) {
+    return;
+  }
+  const int position =
+      sorted_positions[(static_cast<int64_t>(seq_idx) * num_kv_heads +
+                        kv_head_idx) *
+                           max_prompt_len +
+                       token_idx];
+  float token_score = 0.0f;
+  for (int j = 0; j < num_queries_per_kv; j++) {
+    token_score =
+        MAX(token_score,
+            score[seq_idx * num_heads * max_prompt_len +
+                  (kv_head_idx * num_queries_per_kv + j) * max_prompt_len +
+                  position]);
+  }
+
   // Quantize kv and write back to cache
   const int* head_block_table_left =
       block_tables + (slot_idx * num_layers * num_kv_heads +
@@ -345,9 +541,7 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
   // NUM_TOKENS_PER_PAGE_HIGH) = 0
 
   // Handle low-precision pages
-  for (int token_idx = thread_idx + count_pruned;
-       token_idx < count_pruned + count_quantized;
-       token_idx += NUM_THREADS_PROMPT) {
+  if (token_idx < count_pruned + count_quantized) {
     // Access block table from the end of high precision blocks
     int64_t dst_physical_block_number = static_cast<int64_t>(
         *(head_block_table_right +
@@ -355,7 +549,7 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
     int token_idx_within_the_page =
         (token_idx - count_pruned) % NUM_TOKENS_PER_PAGE_LOW;
     const int64_t src_kv_idx_base =
-        (prompt_start + s_positions[token_idx]) * kv_stride +
+        (prompt_start + position) * kv_stride +
         kv_head_idx * HEAD_SIZE;
 
     // Loop over key groups
@@ -372,10 +566,19 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       float key_min = FLT_MAX;
       float key_max = -FLT_MAX;
 #pragma unroll
-      for (int offset = key_group_start; offset < key_group_end; offset += 1) {
+      for (int offset = key_group_start + lane; offset < key_group_end;
+           offset += WARP_SIZE) {
         const int64_t src_kv_idx = src_kv_idx_base + offset;
         key_min = MIN(key_min, to_float(key[src_kv_idx]));
         key_max = MAX(key_max, to_float(key[src_kv_idx]));
+      }
+
+      // Shuffle into temporaries: MIN and MAX evaluate an argument twice.
+      for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+        const float other_min = __shfl_xor_sync(0xffffffff, key_min, mask);
+        const float other_max = __shfl_xor_sync(0xffffffff, key_max, mask);
+        key_min = MIN(key_min, other_min);
+        key_max = MAX(key_max, other_max);
       }
 
       float key_scale = __fdividef(key_max - key_min, range_k_low);
@@ -389,8 +592,8 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       //                                        THREAD_GROUP_SIZE_K,
       //                                        K_VEC_SIZE]
 #pragma unroll
-      for (int i = key_chunk_idx * NUM_K_PACKS_LOW_PER_GROUP;
-           i < (key_chunk_idx + 1) * NUM_K_PACKS_LOW_PER_GROUP; i++) {
+      for (int i = key_chunk_idx * NUM_K_PACKS_LOW_PER_GROUP + lane;
+           i < (key_chunk_idx + 1) * NUM_K_PACKS_LOW_PER_GROUP; i += WARP_SIZE) {
         // const int vec_idx = i / K_VEC_SIZE;
         // const int idx_0 = vec_idx % NUM_VECS_PER_THREAD_K_LOW;
         // const int idx_1 = token_idx_within_the_page;
@@ -410,11 +613,11 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
             key + src_kv_idx_base + i * K_PACK_SIZE_LOW, BITS_K_LOW,
             inv_key_scale, key_zero_point);
       }
-      from_float(kv_cache[k_meta_offset +
+      if (lane == 0) from_float(kv_cache[k_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_K_LOW +
                           key_chunk_idx * 2],
                  key_scale);
-      from_float(kv_cache[k_meta_offset +
+      if (lane == 0) from_float(kv_cache[k_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_K_LOW +
                           key_chunk_idx * 2 + 1],
                  key_zero_point);
@@ -436,11 +639,19 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       float value_max = -FLT_MAX;
 
 #pragma unroll
-      for (int offset = value_group_start; offset < value_group_end;
-           offset += 1) {
+      for (int offset = value_group_start + lane; offset < value_group_end;
+           offset += WARP_SIZE) {
         const int64_t src_kv_idx = src_kv_idx_base + offset;
         value_min = MIN(value_min, to_float(value[src_kv_idx]));
         value_max = MAX(value_max, to_float(value[src_kv_idx]));
+      }
+
+      // Shuffle into temporaries: MIN and MAX evaluate an argument twice.
+      for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+        const float other_min = __shfl_xor_sync(0xffffffff, value_min, mask);
+        const float other_max = __shfl_xor_sync(0xffffffff, value_max, mask);
+        value_min = MIN(value_min, other_min);
+        value_max = MAX(value_max, other_max);
       }
 
       float value_scale = __fdividef(value_max - value_min, range_v_low);
@@ -455,8 +666,8 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       //                                          THREAD_GROUP_SIZE_V,
       //                                          V_VEC_SIZE]
 #pragma unroll
-      for (int i = value_chunk_idx * NUM_V_PACKS_LOW_PER_GROUP;
-           i < (value_chunk_idx + 1) * NUM_V_PACKS_LOW_PER_GROUP; i++) {
+      for (int i = value_chunk_idx * NUM_V_PACKS_LOW_PER_GROUP + lane;
+           i < (value_chunk_idx + 1) * NUM_V_PACKS_LOW_PER_GROUP; i += WARP_SIZE) {
         // const int idx_0 = i % NUM_PACKS_PER_THREAD_V_LOW;
         // const int idx_1 = token_idx_within_the_page / V_VEC_SIZE;
         // const int idx_2 = i / NUM_PACKS_PER_THREAD_V_LOW;
@@ -473,11 +684,11 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
             value + src_kv_idx_base + i * V_PACK_SIZE_LOW, BITS_V_LOW,
             inv_value_scale, value_zero_point);
       }
-      from_float(kv_cache[v_meta_offset +
+      if (lane == 0) from_float(kv_cache[v_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_V_LOW +
                           value_chunk_idx * 2],
                  value_scale);
-      from_float(kv_cache[v_meta_offset +
+      if (lane == 0) from_float(kv_cache[v_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_V_LOW +
                           value_chunk_idx * 2 + 1],
                  value_zero_point);
@@ -486,30 +697,30 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
     // Write score to cache.
     const int64_t score_offset =
         dst_physical_block_number * unified_page_size + SCORE_BASE_LOW;
-    *reinterpret_cast<float*>(
+    if (lane == 0) *reinterpret_cast<float*>(
         &kv_cache[score_offset + token_idx_within_the_page * 2]) =
-        s_scores[s_positions[token_idx]];
+        token_score;
 
     // Write position to cache.
-    int ideal_num_queries = prompt_len - s_positions[token_idx];
+    int ideal_num_queries = prompt_len - position;
     int real_num_queries = MIN(ideal_num_queries, NUM_TOKENS_SCORE);
     const int64_t position_offset =
         dst_physical_block_number * unified_page_size + POSITION_BASE_LOW;
     // *reinterpret_cast<int*>(&kv_cache[position_offset +
-    // token_idx_within_the_page * 2]) = s_positions[token_idx];
+    // token_idx_within_the_page * 2]) = position;
 
-    // A smart trick: by writing s_positions[token_idx] + (ideal_num_queries -
+    // A smart trick: by writing position + (ideal_num_queries -
     // real_num_queries) to the position cache,
     //                we effectively ensure that in decode phase, num_queries is
     //                calculated correctly.
-    *reinterpret_cast<int*>(
+    if (lane == 0) *reinterpret_cast<int*>(
         &kv_cache[position_offset + token_idx_within_the_page * 2]) =
-        s_positions[token_idx] + (ideal_num_queries - real_num_queries);
+        position + (ideal_num_queries - real_num_queries);
   }
 
+
   // Handle high-precision pages
-  for (int token_idx = thread_idx + count_pruned + count_quantized;
-       token_idx < prompt_len; token_idx += NUM_THREADS_PROMPT) {
+  if (token_idx >= count_pruned + count_quantized) {
     // Access block table from left
     int64_t dst_physical_block_number = static_cast<int64_t>(
         *(head_block_table_left + (token_idx - count_pruned - count_quantized) /
@@ -517,7 +728,7 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
     int token_idx_within_the_page =
         (token_idx - count_pruned - count_quantized) % NUM_TOKENS_PER_PAGE_HIGH;
     const int64_t src_kv_idx_base =
-        (prompt_start + s_positions[token_idx]) * kv_stride +
+        (prompt_start + position) * kv_stride +
         kv_head_idx * HEAD_SIZE;
 
     // if ((token_idx == prompt_len - 1 || token_idx == count_pruned +
@@ -545,10 +756,19 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       float key_min = FLT_MAX;
       float key_max = -FLT_MAX;
 #pragma unroll
-      for (int offset = key_group_start; offset < key_group_end; offset += 1) {
+      for (int offset = key_group_start + lane; offset < key_group_end;
+           offset += WARP_SIZE) {
         const int64_t src_kv_idx = src_kv_idx_base + offset;
         key_min = MIN(key_min, to_float(key[src_kv_idx]));
         key_max = MAX(key_max, to_float(key[src_kv_idx]));
+      }
+
+      // Shuffle into temporaries: MIN and MAX evaluate an argument twice.
+      for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+        const float other_min = __shfl_xor_sync(0xffffffff, key_min, mask);
+        const float other_max = __shfl_xor_sync(0xffffffff, key_max, mask);
+        key_min = MIN(key_min, other_min);
+        key_max = MAX(key_max, other_max);
       }
 
       float key_scale = __fdividef(key_max - key_min, range_k_high);
@@ -562,8 +782,8 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       //                                        THREAD_GROUP_SIZE_K,
       //                                        K_VEC_SIZE]
 #pragma unroll
-      for (int i = key_chunk_idx * NUM_K_PACKS_HIGH_PER_GROUP;
-           i < (key_chunk_idx + 1) * NUM_K_PACKS_HIGH_PER_GROUP; i++) {
+      for (int i = key_chunk_idx * NUM_K_PACKS_HIGH_PER_GROUP + lane;
+           i < (key_chunk_idx + 1) * NUM_K_PACKS_HIGH_PER_GROUP; i += WARP_SIZE) {
         // const int vec_idx = i / K_VEC_SIZE;
         // const int idx_0 = vec_idx % NUM_VECS_PER_THREAD_K_HIGH;
         // const int idx_1 = token_idx_within_the_page;
@@ -583,11 +803,11 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
             key + src_kv_idx_base + i * K_PACK_SIZE_HIGH, BITS_K_HIGH,
             inv_key_scale, key_zero_point);
       }
-      from_float(kv_cache[k_meta_offset +
+      if (lane == 0) from_float(kv_cache[k_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_K_HIGH +
                           key_chunk_idx * 2],
                  key_scale);
-      from_float(kv_cache[k_meta_offset +
+      if (lane == 0) from_float(kv_cache[k_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_K_HIGH +
                           key_chunk_idx * 2 + 1],
                  key_zero_point);
@@ -608,11 +828,19 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       float value_min = FLT_MAX;
       float value_max = -FLT_MAX;
 #pragma unroll
-      for (int offset = value_group_start; offset < value_group_end;
-           offset += 1) {
+      for (int offset = value_group_start + lane; offset < value_group_end;
+           offset += WARP_SIZE) {
         const int64_t src_kv_idx = src_kv_idx_base + offset;
         value_min = MIN(value_min, to_float(value[src_kv_idx]));
         value_max = MAX(value_max, to_float(value[src_kv_idx]));
+      }
+
+      // Shuffle into temporaries: MIN and MAX evaluate an argument twice.
+      for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+        const float other_min = __shfl_xor_sync(0xffffffff, value_min, mask);
+        const float other_max = __shfl_xor_sync(0xffffffff, value_max, mask);
+        value_min = MIN(value_min, other_min);
+        value_max = MAX(value_max, other_max);
       }
 
       float value_scale = __fdividef(value_max - value_min, range_v_high);
@@ -627,8 +855,8 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
       //                                          THREAD_GROUP_SIZE_V,
       //                                          V_VEC_SIZE]
 #pragma unroll
-      for (int i = value_chunk_idx * NUM_V_PACKS_HIGH_PER_GROUP;
-           i < (value_chunk_idx + 1) * NUM_V_PACKS_HIGH_PER_GROUP; i++) {
+      for (int i = value_chunk_idx * NUM_V_PACKS_HIGH_PER_GROUP + lane;
+           i < (value_chunk_idx + 1) * NUM_V_PACKS_HIGH_PER_GROUP; i += WARP_SIZE) {
         // const int idx_0 = i % NUM_PACKS_PER_THREAD_V_HIGH;
         // const int idx_1 = token_idx_within_the_page / V_VEC_SIZE;
         // const int idx_2 = i / NUM_PACKS_PER_THREAD_V_HIGH;
@@ -645,11 +873,11 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
             value + src_kv_idx_base + i * V_PACK_SIZE_HIGH, BITS_V_HIGH,
             inv_value_scale, value_zero_point);
       }
-      from_float(kv_cache[v_meta_offset +
+      if (lane == 0) from_float(kv_cache[v_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_V_HIGH +
                           value_chunk_idx * 2],
                  value_scale);
-      from_float(kv_cache[v_meta_offset +
+      if (lane == 0) from_float(kv_cache[v_meta_offset +
                           token_idx_within_the_page * 2 * CHUNKS_V_HIGH +
                           value_chunk_idx * 2 + 1],
                  value_zero_point);
@@ -658,22 +886,22 @@ __global__ void compress_and_append_cache_prompt_phase_kernel(
     // Write score to cache.
     const int64_t score_offset =
         dst_physical_block_number * unified_page_size + SCORE_BASE_HIGH;
-    *reinterpret_cast<float*>(
+    if (lane == 0) *reinterpret_cast<float*>(
         &kv_cache[score_offset + token_idx_within_the_page * 2]) =
-        s_scores[s_positions[token_idx]];
+        token_score;
 
     // Write position to cache.
-    int ideal_num_queries = prompt_len - s_positions[token_idx];
+    int ideal_num_queries = prompt_len - position;
     int real_num_queries = MIN(ideal_num_queries, NUM_TOKENS_SCORE);
     const int64_t position_offset =
         dst_physical_block_number * unified_page_size + POSITION_BASE_HIGH;
-    // A smart trick: by writing s_positions[token_idx] + (ideal_num_queries -
+    // A smart trick: by writing position + (ideal_num_queries -
     // real_num_queries) to the position cache,
     //                we effectively ensure that in decode phase, num_queries is
     //                calculated correctly.
-    *reinterpret_cast<int*>(
+    if (lane == 0) *reinterpret_cast<int*>(
         &kv_cache[position_offset + token_idx_within_the_page * 2]) =
-        s_positions[token_idx] + (ideal_num_queries - real_num_queries);
+        position + (ideal_num_queries - real_num_queries);
   }
 }
 
@@ -1393,7 +1621,7 @@ __global__ void compress_and_append_cache_decode_phase_kernel(
     T, HEAD_SIZE, BITS_K_HIGH, BITS_V_HIGH, BITS_K_LOW, BITS_V_LOW,           \
     CHUNKS_K_HIGH, CHUNKS_V_HIGH, CHUNKS_K_LOW, CHUNKS_V_LOW,                 \
     NUM_TOKENS_PER_PAGE_HIGH, NUM_TOKENS_PER_PAGE_LOW, THREAD_GROUP_SIZE_V)   \
-  diffkv::compress_and_append_cache_prompt_phase_kernel<                       \
+  diffkv::select_prompt_tokens_kernel<                                         \
       T, HEAD_SIZE, BITS_K_HIGH, BITS_V_HIGH, BITS_K_LOW, BITS_V_LOW,         \
       CHUNKS_K_HIGH, CHUNKS_V_HIGH, CHUNKS_K_LOW, CHUNKS_V_LOW,               \
       NUM_TOKENS_PER_PAGE_HIGH, NUM_TOKENS_PER_PAGE_LOW, THREAD_GROUP_SIZE_V> \
@@ -1403,9 +1631,24 @@ __global__ void compress_and_append_cache_decode_phase_kernel(
           reinterpret_cast<uint16_t*>(kv_cache.data_ptr()),                   \
           slot_ids.data_ptr<int>(), block_tables.data_ptr<int>(),             \
           kv_len_tables.data_ptr<int>(), seq_start_loc.data_ptr<int>(),       \
+          sorted_positions.data_ptr<int>(),                                   \
           compress_config_tables.data_ptr<float>(), max_prompt_len,           \
           kv_buffer_size, layer_idx, kv_stride, num_layers, num_heads,        \
-          num_kv_heads, unified_page_size, max_num_blocks_per_seq);
+          num_kv_heads, unified_page_size, max_num_blocks_per_seq);           \
+  C10_CUDA_KERNEL_LAUNCH_CHECK();                                             \
+  diffkv::write_prompt_tokens_kernel<                                          \
+      T, HEAD_SIZE, BITS_K_HIGH, BITS_V_HIGH, BITS_K_LOW, BITS_V_LOW,         \
+      CHUNKS_K_HIGH, CHUNKS_V_HIGH, CHUNKS_K_LOW, CHUNKS_V_LOW,               \
+      NUM_TOKENS_PER_PAGE_HIGH, NUM_TOKENS_PER_PAGE_LOW, THREAD_GROUP_SIZE_V> \
+      <<<write_grid, write_block, 0, stream>>>(                               \
+          reinterpret_cast<T*>(key.data_ptr()),                               \
+          reinterpret_cast<T*>(value.data_ptr()), score.data_ptr<float>(),    \
+          reinterpret_cast<uint16_t*>(kv_cache.data_ptr()),                   \
+          slot_ids.data_ptr<int>(), block_tables.data_ptr<int>(),             \
+          kv_len_tables.data_ptr<int>(), seq_start_loc.data_ptr<int>(),       \
+          sorted_positions.data_ptr<int>(), max_prompt_len, layer_idx,        \
+          kv_stride, num_layers, num_heads, num_kv_heads, unified_page_size,  \
+          max_num_blocks_per_seq);
 
 #define CALL_PROMPT_PHASE_CACHE_LAUNCHER_QUANT_CONFIG(T, HEAD_SIZE)            \
   TORCH_CHECK((quant_config == std::vector<int>{8, 4, 4, 2, 1, 1, 1, 1}),      \
@@ -1500,6 +1743,13 @@ void compress_and_append_cache_prompt_phase(
 
   dim3 grid(num_kv_heads, num_seqs);
   dim3 block(NUM_THREADS_PROMPT);
+  // Phase 2 runs one warp per score-ordered token of every (head, sequence).
+  constexpr int kWriteWarps = 4;
+  dim3 write_grid(num_kv_heads, num_seqs,
+                  (max_prompt_len + kWriteWarps - 1) / kWriteWarps);
+  dim3 write_block(kWriteWarps * WARP_SIZE);
+  torch::Tensor sorted_positions = torch::empty(
+      {num_seqs, num_kv_heads, max_prompt_len}, key.options().dtype(at::kInt));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (key.dtype() == at::ScalarType::Half) {

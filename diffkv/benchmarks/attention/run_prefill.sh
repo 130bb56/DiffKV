@@ -11,6 +11,11 @@
 # Results: attention/logs/<UTC>-prefill-b<batch>/
 #   source_hashes.json, gpu_telemetry.csv, latency.json, console.log
 # DIFFKV_GPU picks the GPU (default 0).
+# DIFFKV_NCU_KERNEL=<regex> runs under Nsight Compute (--set full, as root, see
+# run_docker.sh) and profiles DIFFKV_NCU_COUNT (default 1) launches of the
+# matching kernels after
+# DIFFKV_NCU_SKIP (default 0) launches; adds kernels.ncu-rep and
+# kernels_details.txt. Its latency.json is not a timing result.
 set -euo pipefail
 
 batches=("$@")
@@ -26,6 +31,11 @@ if [ -n "${DIFFKV_PROMPTS:-}" ]; then
 fi
 if [ "${DIFFKV_PREFILL_PARTS:-0}" = 1 ]; then
   extra+=(--parts)
+fi
+profiler=()
+sys_admin=0
+if [ -n "${DIFFKV_NCU_KERNEL:-}" ]; then
+  sys_admin=1
 fi
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -45,9 +55,22 @@ for batch in "${batches[@]}"; do
   telemetry=$!
   "${run_docker[@]}" python "$diffkv/benchmarks/math500/record_source_hashes.py" \
     --output "$run_dir/source_hashes.json"
-  "${run_docker[@]}" env FLASHINFER_EXTRA_CUDAFLAGS=--compress-mode=none \
+  if [ -n "${DIFFKV_NCU_KERNEL:-}" ]; then
+    profiler=(ncu --set full --kernel-name "regex:$DIFFKV_NCU_KERNEL"
+      --launch-skip "${DIFFKV_NCU_SKIP:-0}" --launch-count "${DIFFKV_NCU_COUNT:-1}"
+      --export "$run_dir/kernels")
+  fi
+  DIFFKV_SYS_ADMIN=$sys_admin "${run_docker[@]}" \
+    env FLASHINFER_EXTRA_CUDAFLAGS=--compress-mode=none "${profiler[@]}" \
     python "$here/benchmark_prefill.py" --batch "$batch" "${extra[@]}" \
     --output "$run_dir/latency.json" > "$run_dir/console.log" 2>&1
+  if [ -n "${DIFFKV_NCU_KERNEL:-}" ]; then
+    # The profiled run executed as root; return its files to the caller.
+    docker run --rm -v "$run_dir:$run_dir" "$image" \
+      chown -R "$(id -u):$(id -g)" "$run_dir"
+    "${run_docker[@]}" ncu --import "$run_dir/kernels.ncu-rep" --page details \
+      > "$run_dir/kernels_details.txt" 2>> "$run_dir/console.log"
+  fi
   kill "$telemetry" 2>/dev/null || true
   telemetry=
   echo "$run_dir"
