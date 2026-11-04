@@ -11,6 +11,7 @@ diffkv/
 ├── csrc/                             DiffKV CUDA kernel과 binding
 ├── docs/DiffKV.pdf                   논문 (git 제외)
 └── benchmarks/
+    ├── evaluation/                   lock_clock.sh (clock 고정, 냉각 대기, telemetry, throttle 판정과 재실행), record_telemetry.py, check_throttle.py
     ├── math500/
     │   ├── generate.py               backend 하나로 문항 생성, 요청별 시간 기록
     │   ├── generation_utils.py       backend 옵션, 문항 읽기, 지표 요약
@@ -79,7 +80,7 @@ repo 루트에서 실행합니다.
 - 엔진 설정: eager, chunked prefill on, async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
-- clock 고정은 docker(`--cap-add=SYS_ADMIN`)로 `nvidia-smi -lgc 1395,1395` 실행
+- clock 고정, telemetry, throttle 판정은 `diffkv/benchmarks/evaluation/lock_clock.sh`가 함: GPU를 다른 프로세스가 쓰고 있으면 중단 → `nvidia-smi base-clocks` 값(1395 MHz)으로 고정 → 30초 이상, 그리고 1395 MHz이고 70°C 이하이고 thermal과 power 제한이 없을 때까지 대기(`origin/main` `cool_before_measurement`와 같은 방식) → 실행, GPU 사용률이 10분(`DIFFKV_STUCK_S`, 지난 정상 실행의 최장 0% 구간은 엔진 초기화 327초) 동안 0%면 kill하고 exit 5 → 실행 구간 전체가 1395 MHz이고 thermal, power, `hw_slowdown`, `sync_boost` flag가 없으면 valid, 아니면 식힌 뒤 다시 실행(최대 3회). 결과 디렉터리에 `gpu_telemetry.jsonl`, `clock_check.json`
 
 ### offline serving의 step별 동시 decode 요청 수
 

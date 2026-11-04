@@ -4,6 +4,7 @@
 # Run one command inside the bringup container. The host (Ubuntu 18.04,
 # glibc 2.27) cannot load torch 2.13, so every DiffKV command goes through here.
 # Usage: run_docker.sh <command> [args...]; DIFFKV_GPU picks the GPU (default 0).
+# DIFFKV_CIDFILE, if set, is where docker writes the container id.
 set -euo pipefail
 
 diffkv_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -30,6 +31,10 @@ if [ "${DIFFKV_SYS_ADMIN:-0}" = 1 ]; then
     -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
   user=(--user 0:0)
 fi
+container_id=()
+if [ -n "${DIFFKV_CIDFILE:-}" ]; then
+  container_id=(--cidfile "$DIFFKV_CIDFILE")
+fi
 # A linked git worktree symlinks .venv, .toolchains, models, .cache and the
 # precompiled vllm binaries to the primary checkout. Mount that checkout
 # read-only (its .cache writable) and import diffkv and vllm from this tree.
@@ -43,7 +48,7 @@ if [ "$primary_repo" != "$diffkv_repo" ]; then
 fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \
-  "${user[@]}" "${profiler_args[@]}" "${worktree_mount[@]}" \
+  "${user[@]}" "${profiler_args[@]}" "${worktree_mount[@]}" "${container_id[@]}" \
   -e CUDA_MODULE_LOADING=LAZY \
   -e CUDA_HOME="$diffkv_repo/.toolchains/cuda-12.9" \
   -e TORCH_CUDA_ARCH_LIST=8.6 -e MAX_JOBS=2 \
