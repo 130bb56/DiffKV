@@ -41,7 +41,8 @@ void launch_reduce(torch::Tensor& out, torch::Tensor& exp_sums,
                    torch::Tensor& tmp_scores, torch::Tensor& slot_ids,
                    torch::Tensor& block_tables, torch::Tensor& kv_len_tables,
                    torch::Tensor& kv_cache, int layer_idx, int num_kv_heads,
-                   int max_context_len) {
+                   int max_context_len, const float* chunk_lse,
+                   float* lse_out) {
   constexpr int PARTITION_SIZE = kPartitionSize;
   const int max_num_partitions =
       max_context_len <= PARTITION_SIZE
@@ -60,7 +61,7 @@ void launch_reduce(torch::Tensor& out, torch::Tensor& exp_sums,
         kv_len_tables.data_ptr<int>(), slot_ids.data_ptr<int>(),
         reinterpret_cast<uint16_t*>(kv_cache.data_ptr()), kv_cache.size(1),
         layer_idx, block_tables.size(1), num_kv_heads, max_context_len,
-        block_tables.size(3), max_num_partitions);
+        block_tables.size(3), max_num_partitions, chunk_lse, lse_out);
   };
   if (out.scalar_type() == at::ScalarType::Half) {
     launch(uint16_t{});
@@ -97,7 +98,9 @@ void launch(torch::Tensor& slot_ids, torch::Tensor& exp_sums,
 }  // namespace gqa_reuse
 }  // namespace diffkv
 
-void sparse_paged_attention_gqa(
+namespace {
+
+void run_gqa_attention(
     torch::Tensor& slot_ids, torch::Tensor& positions, torch::Tensor& out,
     torch::Tensor& exp_sums, torch::Tensor& max_logits, torch::Tensor& tmp_out,
     torch::Tensor& tmp_scores, torch::Tensor& query, torch::Tensor& kv_cache,
@@ -107,7 +110,9 @@ void sparse_paged_attention_gqa(
     int meta_k_high, int meta_v_high, int meta_k_low, int meta_v_low,
     int k_vec_size, int v_vec_size, int num_tokens_per_page_high,
     int num_tokens_per_page_low,
-    const c10::optional<torch::Tensor>& alibi_slopes) {
+    const c10::optional<torch::Tensor>& alibi_slopes,
+    const c10::optional<torch::Tensor>& chunk_lse,
+    const c10::optional<torch::Tensor>& lse_out) {
   TORCH_CHECK(query.is_cuda() && query.scalar_type() == at::kHalf,
               "DiffKV bringup requires FP16 CUDA queries");
   const c10::cuda::CUDAGuard device_guard(query.device());
@@ -204,8 +209,71 @@ void sparse_paged_attention_gqa(
     TORCH_CHECK(false,
                 "Unsupported GQA reuse attention dtype: ", query.scalar_type());
   }
+  const float* chunk_lse_ptr = nullptr;
+  float* lse_out_ptr = nullptr;
+  if (chunk_lse.has_value()) {
+    diffkv::check_tensor(*chunk_lse, query, at::kFloat, "chunk log-sum-exp");
+    TORCH_CHECK(chunk_lse->numel() >= query_heads,
+                "Chunk log-sum-exp needs one value per query row and head");
+    chunk_lse_ptr = chunk_lse->data_ptr<float>();
+  }
+  if (lse_out.has_value()) {
+    diffkv::check_tensor(*lse_out, query, at::kFloat, "log-sum-exp output");
+    TORCH_CHECK(lse_out->numel() >= query_heads,
+                "Log-sum-exp output needs one value per query row and head");
+    lse_out_ptr = lse_out->data_ptr<float>();
+  }
   diffkv::gqa_reuse::launch_reduce(
       out, exp_sums, max_logits, tmp_out, tmp_scores, slot_ids, block_tables,
-      kv_len_tables, kv_cache, layer_idx, num_kv_heads, max_context_len);
+      kv_len_tables, kv_cache, layer_idx, num_kv_heads, max_context_len,
+      chunk_lse_ptr, lse_out_ptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void sparse_paged_attention_gqa(
+    torch::Tensor& slot_ids, torch::Tensor& positions, torch::Tensor& out,
+    torch::Tensor& exp_sums, torch::Tensor& max_logits, torch::Tensor& tmp_out,
+    torch::Tensor& tmp_scores, torch::Tensor& query, torch::Tensor& kv_cache,
+    int layer_idx, int num_kv_heads, float scale, torch::Tensor& block_tables,
+    torch::Tensor& kv_len_tables, int max_context_len, int num_bits_k_high,
+    int num_bits_v_high, int num_bits_k_low, int num_bits_v_low,
+    int meta_k_high, int meta_v_high, int meta_k_low, int meta_v_low,
+    int k_vec_size, int v_vec_size, int num_tokens_per_page_high,
+    int num_tokens_per_page_low,
+    const c10::optional<torch::Tensor>& alibi_slopes) {
+  run_gqa_attention(slot_ids, positions, out, exp_sums, max_logits, tmp_out,
+                    tmp_scores, query, kv_cache, layer_idx, num_kv_heads, scale,
+                    block_tables, kv_len_tables, max_context_len,
+                    num_bits_k_high, num_bits_v_high, num_bits_k_low,
+                    num_bits_v_low, meta_k_high, meta_v_high, meta_k_low,
+                    meta_v_low, k_vec_size, v_vec_size,
+                    num_tokens_per_page_high, num_tokens_per_page_low,
+                    alibi_slopes, c10::nullopt, c10::nullopt);
+}
+
+// Chunked prefill: one row per chunk query over that request's packed prefix.
+// chunk_lse holds the FA2 log-sum-exp of each row over its own chunk; the
+// output and cache scores come back normalized over prefix and chunk, and
+// lse_out receives the combined log-sum-exp for rescaling the chunk output.
+void sparse_paged_attention_gqa_prefix(
+    torch::Tensor& slot_ids, torch::Tensor& positions, torch::Tensor& out,
+    torch::Tensor& exp_sums, torch::Tensor& max_logits, torch::Tensor& tmp_out,
+    torch::Tensor& tmp_scores, torch::Tensor& query, torch::Tensor& kv_cache,
+    int layer_idx, int num_kv_heads, float scale, torch::Tensor& block_tables,
+    torch::Tensor& kv_len_tables, int max_context_len, int num_bits_k_high,
+    int num_bits_v_high, int num_bits_k_low, int num_bits_v_low,
+    int meta_k_high, int meta_v_high, int meta_k_low, int meta_v_low,
+    int k_vec_size, int v_vec_size, int num_tokens_per_page_high,
+    int num_tokens_per_page_low, torch::Tensor& chunk_lse,
+    torch::Tensor& lse_out) {
+  run_gqa_attention(slot_ids, positions, out, exp_sums, max_logits, tmp_out,
+                    tmp_scores, query, kv_cache, layer_idx, num_kv_heads, scale,
+                    block_tables, kv_len_tables, max_context_len,
+                    num_bits_k_high, num_bits_v_high, num_bits_k_low,
+                    num_bits_v_low, meta_k_high, meta_v_high, meta_k_low,
+                    meta_v_low, k_vec_size, v_vec_size,
+                    num_tokens_per_page_high, num_tokens_per_page_low,
+                    c10::nullopt, chunk_lse, lse_out);
 }

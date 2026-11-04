@@ -7,7 +7,7 @@ vLLM v0.32.0(`5df63a7`) 위에 DiffKV attention과 KV cache 관리를 붙인 코
 ```text
 diffkv/
 ├── run_docker.sh                     container 안에서 명령 실행
-├── python/diffkv/                    DiffKV Python 코드 (backend, cache 관리, admission, model runner hook, extension build)
+├── python/diffkv/                    DiffKV Python 코드 (backend, cache 관리, admission, model runner hook, extension build, chunked prefill attention)
 ├── csrc/                             DiffKV CUDA kernel과 binding
 ├── docs/DiffKV.pdf                   논문 (git 제외)
 └── benchmarks/
@@ -24,6 +24,8 @@ diffkv/
     └── attention/
         ├── run_latency.sh            batch별 decode latency 실행
         ├── benchmark_latency.py      DiffKV, vLLM FA2 FP16, FlashInfer FP8 decode latency benchmark
+        ├── run_prefill.sh            batch별 chunked prefill attention latency 실행
+        ├── benchmark_prefill.py      DiffKV chunked prefill (python/diffkv/prefill.py), vLLM FA2 FP16 prefill latency benchmark
         ├── correctness.py
         ├── profile_nsys.py           nsys로 kernel latency breakdown
         └── logs/
@@ -57,6 +59,7 @@ repo 루트에서 실행합니다.
 | extension build | `bash diffkv/run_docker.sh python -m diffkv.build_ops` |
 | kernel 정확도 검사 | `bash diffkv/run_docker.sh python diffkv/benchmarks/attention/correctness.py` |
 | attention latency | `bash diffkv/benchmarks/attention/run_latency.sh [batch ...]` (기본 1 8 32, KV 길이 1024 2048 4096 8192) |
+| prefill attention latency | `bash diffkv/benchmarks/attention/run_prefill.sh [batch ...]` (기본 1 8 32, prefix 0 2048, chunk 256 1024, `DIFFKV_PREFIXES`, `DIFFKV_CHUNKS`로 변경) |
 | attention profile (Nsight Systems) | `bash diffkv/benchmarks/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | correctness | `bash diffkv/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |

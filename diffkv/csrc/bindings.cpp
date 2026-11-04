@@ -9,6 +9,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("packed_page_bytes") = 6784;
   auto attention = module.def_submodule("ops");
   attention.def("sparse_paged_attention_gqa", &sparse_paged_attention_gqa);
+  attention.def("sparse_paged_attention_gqa_prefix",
+                &sparse_paged_attention_gqa_prefix);
+  attention.def("dequantize_prefix", &dequantize_prefix);
   auto cache = module.def_submodule("cache_ops");
   cache.def("compress_and_append_cache_prompt_phase",
             &compress_and_append_cache_prompt_phase);
