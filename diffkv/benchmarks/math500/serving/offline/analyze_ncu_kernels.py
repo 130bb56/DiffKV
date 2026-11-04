@@ -85,8 +85,8 @@ def summarize(raw_path, outputs_path):
     return {
         "raw": str(raw_path),
         "definitions": {
-            "mean": "Mean over the kernel's instances in the profiled step "
-            "(one per attention layer per profiled step)",
+            "mean": "Mean over the kernel's instances in the profiled steps "
+            "(one per profiled step, decoder layer 0 only)",
             "stall ratios": "smsp__average_warps_issue_stalled_<reason>_per_issue_"
             "active.ratio: warps stalled on the reason per issued instruction",
         },

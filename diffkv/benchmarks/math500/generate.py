@@ -189,16 +189,16 @@ def parse_args():
         "steps FIRST..FIRST+COUNT-1 with one NVTX range per step, then stop the run",
     )
     parser.add_argument(
-        "--profile-layer",
-        type=int,
-        help="wrap this decoder layer's attention module in an NVTX range "
-        "layer/<index>, for ncu --nvtx-include",
+        "--profile-first-layer",
+        action="store_true",
+        help="for ncu --profile-from-start off: in each profiled step, start and "
+        "stop the profiler around decoder layer 0's attention module only",
     )
     args = parser.parse_args()
     if args.profile_steps and (args.profile_steps[0] < 0 or args.profile_steps[1] < 1):
         parser.error("--profile-steps needs FIRST >= 0 and COUNT >= 1")
-    if args.profile_layer is not None and not args.profile_steps:
-        parser.error("--profile-layer needs --profile-steps")
+    if args.profile_first_layer and not args.profile_steps:
+        parser.error("--profile-first-layer needs --profile-steps")
     if args.workload is None:
         args.workload = PROBLEMS[args.expected_count]
     if args.output is None:
@@ -330,29 +330,28 @@ def main():
             for layer in forward_context.values()
             if hasattr(layer, "attn_backend")
         ]
-        if args.profile_layer is not None:
-            prefix = f"layers.{args.profile_layer}."
+        layer_profiling = False
+        if args.profile_first_layer:
             selected = [
-                layer
+                (name, layer)
                 for name, layer in forward_context.items()
-                if prefix in name and hasattr(layer, "attn_backend")
+                if "layers.0." in name and hasattr(layer, "attn_backend")
             ]
             if len(selected) != 1:
-                raise ValueError(f"No single attention module in {prefix}")
-            label = f"layer/{args.profile_layer}"
+                raise ValueError("No single attention module in layers.0.")
 
             # Hooks must return None; a returned value replaces inputs or output.
-            def push(*_):
-                torch.cuda.nvtx.range_push(label)
+            def start(*_):
+                if layer_profiling:
+                    torch.cuda.profiler.start()
 
-            def pop(*_):
-                torch.cuda.nvtx.range_pop()
+            def stop(*_):
+                if layer_profiling:
+                    torch.cuda.profiler.stop()
 
-            selected[0].register_forward_pre_hook(push)
-            selected[0].register_forward_hook(pop)
-            metadata["profile_layer_module"] = next(
-                name for name, layer in forward_context.items() if layer is selected[0]
-            )
+            selected[0][1].register_forward_pre_hook(start)
+            selected[0][1].register_forward_hook(stop)
+            metadata["profile_layer_module"] = selected[0][0]
         metadata["kv_cache"]["resolved_cache_dtype"] = (
             engine.vllm_config.cache_config.cache_dtype
         )
@@ -437,12 +436,15 @@ def main():
         step = 0
         while engine.has_unfinished_requests():
             profiling = profile_first <= step < profile_first + profile_count
-            if profiling and step == profile_first:
+            step_range = profiling and not args.profile_first_layer
+            if step_range and step == profile_first:
                 torch.cuda.synchronize()
                 torch.cuda.profiler.start()
             if profiling:
                 torch.cuda.nvtx.range_push(f"step/{step}")
+            layer_profiling = profiling and args.profile_first_layer
             outputs = engine.step()
+            layer_profiling = False
             if profiling:
                 torch.cuda.nvtx.range_pop()
             now = time.perf_counter()
@@ -481,8 +483,9 @@ def main():
                     }
                 )
                 if step == profile_first + profile_count - 1:
-                    torch.cuda.synchronize()
-                    torch.cuda.profiler.stop()
+                    if step_range:
+                        torch.cuda.synchronize()
+                        torch.cuda.profiler.stop()
                     break
             step += 1
         if args.profile_steps:

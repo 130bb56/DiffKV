@@ -16,11 +16,11 @@
 # the suffix -nsys-s<FIRST>-n<COUNT> and also trace.nsys-rep, trace.sqlite and
 # step_breakdown.json (analyze_nsys_steps.py).
 # DIFFKV_NCU_STEPS="FIRST COUNT" runs under Nsight Compute (--set full) and
-# profiles the attention, reduce and KV cache write kernels of measured engine
-# steps FIRST..FIRST+COUNT-1, then stops the run. The directory gets the suffix
-# -ncu-s<FIRST>-n<COUNT> and also kernels.ncu-rep, kernels_raw.csv and
-# kernel_summary.json (analyze_ncu_kernels.py). DIFFKV_NCU_LAYER=<index> limits
-# it to that decoder layer's attention module (suffix -l<index>).
+# profiles the attention, reduce and KV cache write kernels that decoder layer
+# 0's attention module launches in measured engine steps FIRST..FIRST+COUNT-1,
+# then stops the run. The directory gets the suffix -ncu-s<FIRST>-n<COUNT> and
+# also kernels.ncu-rep, kernels_raw.csv and kernel_summary.json
+# (analyze_ncu_kernels.py).
 set -euo pipefail
 
 backend=${1:?backend: fp16, diffkv or fp8}
@@ -47,12 +47,8 @@ if [ -n "${DIFFKV_NSYS_STEPS:-}" ]; then
 elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   read -r first count <<< "$DIFFKV_NCU_STEPS"
   suffix="-ncu-s$first-n$count"
-  profile=(--profile-steps "$first" "$count")
+  profile=(--profile-steps "$first" "$count" --profile-first-layer)
   sys_admin=1
-  if [ -n "${DIFFKV_NCU_LAYER:-}" ]; then
-    suffix+="-l$DIFFKV_NCU_LAYER"
-    profile+=(--profile-layer "$DIFFKV_NCU_LAYER")
-  fi
 fi
 run_dir="$math500/logs/serving/offline/$(date -u +%Y%m%dT%H%M%SZ)-sample50-$backend$suffix"
 mkdir -p "$run_dir"
@@ -66,9 +62,6 @@ elif [ -n "${DIFFKV_NCU_STEPS:-}" ]; then
   kernels+="|BatchDecodeWithPagedKVCache|MergeStates|reshape_and_cache"
   profiler=(ncu --profile-from-start off --set full --kernel-name "regex:$kernels"
     --force-overwrite --export "$run_dir/kernels")
-  if [ -n "${DIFFKV_NCU_LAYER:-}" ]; then
-    profiler+=(--nvtx --nvtx-include "layer/$DIFFKV_NCU_LAYER/")
-  fi
 fi
 
 "${run_docker[@]}" python "$math500/record_source_hashes.py" \
