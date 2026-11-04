@@ -59,7 +59,7 @@ repo 루트에서 실행합니다.
 | extension build | `bash diffkv/run_docker.sh python -m diffkv.build_ops` |
 | kernel 정확도 검사 | `bash diffkv/run_docker.sh python diffkv/benchmarks/attention/correctness.py` (decode: FP64 oracle, prefill: prompt_prefill을 현재 backend 경로와 비교) |
 | attention latency | `bash diffkv/benchmarks/attention/run_latency.sh [batch ...]` (기본 1 8 32, KV 길이 1024 2048 4096 8192) |
-| prefill latency | `bash diffkv/benchmarks/attention/run_prefill.sh [batch ...]` (기본 batch 1 8 32, prompt 256 1024, `DIFFKV_PROMPTS`로 변경) |
+| prefill latency | `bash diffkv/benchmarks/attention/run_prefill.sh [batch ...]` (기본 batch 1 8 32, prompt 256 1024, `DIFFKV_PROMPTS`로 변경, `DIFFKV_PREFILL_PARTS=1`이면 prompt_prefill의 attention, score, 압축 launch도 따로 잼) |
 | attention profile (Nsight Systems) | `bash diffkv/benchmarks/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | correctness | `bash diffkv/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |

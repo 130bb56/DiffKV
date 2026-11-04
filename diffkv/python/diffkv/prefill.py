@@ -552,6 +552,85 @@ def chunk_prefill_attention(
     return output, chunk_scores, lse.transpose(0, 1)
 
 
+def prompt_attention(query, key, value, cu_seqlens, max_seqlen, scale, out=None):
+    """Causal FA2 over whole prompts; returns the output and log-sum-exp."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        out=out,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=scale,
+        causal=True,
+        fa_version=2,
+        return_softmax_lse=True,
+    )
+
+
+def prompt_scores(query, key, lse, cu_seqlens, max_seqlen, scale):
+    """Group-maximum token scores laid out [requests, KV heads, max_seqlen]."""
+    kv_heads = key.shape[1]
+    scores = torch.empty(
+        (cu_seqlens.numel() - 1, kv_heads, max_seqlen),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    column_scores(
+        query,
+        key,
+        lse,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        scale,
+        scores,
+        kv_heads=kv_heads,
+        q_head_stride=query.stride(1),
+        k_head_stride=key.stride(1),
+        k_seq_stride=0,
+        lse_head_stride=lse.stride(0),
+        lse_token_stride=lse.stride(1),
+        out_token_stride=scores.stride(2),
+        out_head_stride=scores.stride(1),
+        out_seq_stride=scores.stride(0),
+    )
+    return scores
+
+
+def compress_prompts(
+    key,
+    value,
+    scores,
+    cu_seqlens,
+    kv_cache,
+    slot_ids,
+    block_tables,
+    kv_len_tables,
+    compress_config_tables,
+    layer_idx,
+):
+    """One prompt-phase writer call for every request of the step."""
+    get_extension().cache_ops.compress_and_append_cache_prompt_phase(
+        key,
+        value,
+        scores,
+        kv_cache,
+        slot_ids,
+        block_tables,
+        kv_len_tables,
+        cu_seqlens,
+        compress_config_tables,
+        KV_BUFFER_SIZE,
+        layer_idx,
+        *QUANT_ARGS,
+    )
+
+
 def prompt_prefill(
     query,
     key,
@@ -575,58 +654,18 @@ def prompt_prefill(
     and one prompt-phase writer call compresses all requests into the cache.
     key and value may be strided views; the writer reads their token stride.
     """
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
-
-    kv_heads = key.shape[1]
-    out, lse = flash_attn_varlen_func(
-        q=query,
-        k=key,
-        v=value,
-        out=out,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=scale,
-        causal=True,
-        fa_version=2,
-        return_softmax_lse=True,
-    )
-    num_requests = cu_seqlens.numel() - 1
-    scores = torch.empty(
-        (num_requests, kv_heads, max_seqlen), dtype=torch.float32, device=query.device
-    )
-    column_scores(
-        query,
-        key,
-        lse,
-        cu_seqlens,
-        cu_seqlens,
-        max_seqlen,
-        scale,
-        scores,
-        kv_heads=kv_heads,
-        q_head_stride=query.stride(1),
-        k_head_stride=key.stride(1),
-        k_seq_stride=0,
-        lse_head_stride=lse.stride(0),
-        lse_token_stride=lse.stride(1),
-        out_token_stride=scores.stride(2),
-        out_head_stride=scores.stride(1),
-        out_seq_stride=scores.stride(0),
-    )
-    get_extension().cache_ops.compress_and_append_cache_prompt_phase(
+    out, lse = prompt_attention(query, key, value, cu_seqlens, max_seqlen, scale, out)
+    scores = prompt_scores(query, key, lse, cu_seqlens, max_seqlen, scale)
+    compress_prompts(
         key,
         value,
         scores,
+        cu_seqlens,
         kv_cache,
         slot_ids,
         block_tables,
         kv_len_tables,
-        cu_seqlens,
         compress_config_tables,
-        KV_BUFFER_SIZE,
         layer_idx,
-        *QUANT_ARGS,
     )
     return out, scores

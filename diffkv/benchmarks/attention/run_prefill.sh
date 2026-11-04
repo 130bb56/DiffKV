@@ -4,7 +4,8 @@
 # Prefill latency of one layer for whole prompts (chunked prefill off): current
 # DiffKV backend path, DiffKV prompt_prefill, vLLM FA2 FP16 and FlashInfer FP8,
 # one run per batch size. Prompt lengths come from benchmark_prefill.py
-# defaults (256 1024) unless DIFFKV_PROMPTS is set. The GPU SM clock
+# defaults (256 1024) unless DIFFKV_PROMPTS is set. DIFFKV_PREFILL_PARTS=1 also
+# times prompt_prefill's attention, score and compression launches. The GPU SM clock
 # is locked to 1395 MHz and GPU telemetry is recorded.
 # Usage: run_prefill.sh [batch ...]   (default: 1 8 32)
 # Results: attention/logs/<UTC>-prefill-b<batch>/
@@ -22,6 +23,9 @@ extra=()
 if [ -n "${DIFFKV_PROMPTS:-}" ]; then
   # shellcheck disable=SC2206
   extra+=(--prompts ${DIFFKV_PROMPTS})
+fi
+if [ "${DIFFKV_PREFILL_PARTS:-0}" = 1 ]; then
+  extra+=(--parts)
 fi
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

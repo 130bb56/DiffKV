@@ -18,6 +18,9 @@ the prompt's KV into its cache:
   FlashInfer paged prefill kernel with FP16 queries, as the vLLM FLASHINFER
   backend does on SM86.
 
+With --parts, prompt_prefill's attention, score and compression launches are
+also timed separately (diffkv_part_*).
+
 Cache allocation, request admission and FlashInfer planning are untimed.
 """
 
@@ -137,8 +140,7 @@ def make_diffkv_serving(batch, prompt, kv_heads):
             "parts": [
                 "per request: key and value copy into the raw prompt buffer",
                 "per request: FA2 (causal_prefill)",
-                "per request: final-64 query scores, matmul and softmax per KV "
-                "head (accumulate_prompt_scores)",
+                "per request: final-64 query scores (accumulate_prompt_scores)",
                 "per request: compress_and_append_cache_prompt_phase",
             ],
         },
@@ -190,6 +192,58 @@ def make_diffkv(batch, prompt, kv_heads):
         },
         {},
     )
+
+
+def make_diffkv_parts(batch, prompt, kv_heads):
+    """prompt_prefill's three launches as separate arms, on the same inputs."""
+    from diffkv.prefill import compress_prompts, prompt_attention, prompt_scores
+
+    lengths = [prompt] * batch
+    query, key, value, starts = qkv_inputs(lengths, kv_heads)
+    controller, request_ids = admit_requests(lengths, kv_heads)
+    slot_ids = controller.metadata(request_ids).slot_ids
+    cu_seqlens = starts.cuda()
+    output = torch.empty_like(query)
+    _, lse = prompt_attention(query, key, value, cu_seqlens, prompt, SCALE, output)
+    scores = prompt_scores(query, key, lse, cu_seqlens, prompt, SCALE)
+
+    def attention(q, k, v):
+        prompt_attention(q, k, v, cu_seqlens, prompt, SCALE, output)
+
+    def score(q, k, lse):
+        prompt_scores(q, k, lse, cu_seqlens, prompt, SCALE)
+
+    def compress(k, v, scores):
+        compress_prompts(
+            k,
+            v,
+            scores,
+            cu_seqlens,
+            controller.kv_cache,
+            slot_ids,
+            controller.block_tables,
+            controller.kv_len_tables,
+            controller.compress_config_tables,
+            LAYER_IDX,
+        )
+
+    compress(key, value, scores)
+    parts = {
+        "diffkv_part_attention": (attention, (query, key, value), "prompt_attention"),
+        "diffkv_part_scores": (score, (query, key, lse), "prompt_scores"),
+        "diffkv_part_compress": (compress, (key, value, scores), "compress_prompts"),
+    }
+    return {
+        name: Arm(
+            function,
+            arguments,
+            output,
+            cache_bytes(controller),
+            {"backend": "DIFFKV", "path": f"diffkv.prefill.{path}"},
+            {},
+        )
+        for name, (function, arguments, path) in parts.items()
+    }
 
 
 def paged_layout(batch, prompt):
@@ -348,6 +402,11 @@ def main():
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--repeat-ms", type=int, default=500)
     parser.add_argument(
+        "--parts",
+        action="store_true",
+        help="also time prompt_prefill's attention, score and compression launches",
+    )
+    parser.add_argument(
         "--output", type=Path, help="default: logs/<UTC>-prefill-b<batch>/latency.json"
     )
     args = parser.parse_args()
@@ -367,6 +426,8 @@ def main():
         arms = {
             name: make(args.batch, prompt, args.kv_heads) for name, make in ARMS.items()
         }
+        if args.parts:
+            arms.update(make_diffkv_parts(args.batch, prompt, args.kv_heads))
         samples = {name: [] for name in arms}
         order = list(arms)
         for name in [*order, *reversed(order)]:
