@@ -8,8 +8,8 @@
 # base clock, cooldown before the run, telemetry, and a rerun when throttled.
 # Usage: run_offline_serving.sh <fp16|diffkv|fp8>
 # Results: math500/logs/serving/offline/<UTC>-sample50-<backend>/
-#   source_hashes.json, gpu_telemetry.jsonl, clock_check.json, outputs.json,
-#   console.log
+#   source_hashes.json, gpu_telemetry.jsonl, clock_check.json, cpu_time.json,
+#   outputs.json, console.log
 # DIFFKV_GPU picks the GPU (default 0).
 # DIFFKV_NSYS_STEPS="FIRST COUNT" runs under Nsight Systems, traces measured
 # engine steps FIRST..FIRST+COUNT-1 and stops the run there. The directory gets

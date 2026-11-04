@@ -80,7 +80,9 @@ repo 루트에서 실행합니다.
 - 엔진 설정: eager, chunked prefill on, async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
-- clock 고정, telemetry, throttle 판정은 `diffkv/benchmarks/evaluation/lock_clock.sh`가 함: GPU를 다른 프로세스가 쓰고 있으면 중단 → `nvidia-smi base-clocks` 값(1395 MHz)으로 고정 → 30초 이상, 그리고 1395 MHz이고 70°C 이하이고 thermal과 power 제한이 없을 때까지 대기(`origin/main` `cool_before_measurement`와 같은 방식) → 실행. 실행 중 telemetry를 1초마다 보고 thermal, power, `hw_slowdown`, `sync_boost` flag나 1395 MHz가 아닌 SM clock이 보이면 바로 kill하고 식힌 뒤 다시 실행(최대 3회), GPU 사용률이 10분(`DIFFKV_STUCK_S`, 지난 정상 실행의 최장 0% 구간은 엔진 초기화 327초) 동안 0%면 kill하고 exit 5 → 끝난 실행 구간 전체를 같은 기준으로 다시 판정해 valid가 아니면 식힌 뒤 다시 실행. 결과 디렉터리에 `gpu_telemetry.jsonl`, `clock_check.json`, kill한 경우 `throttled.json` 또는 `stuck.json`
+- clock 고정, telemetry, throttle 판정은 `diffkv/benchmarks/evaluation/lock_clock.sh`가 함: GPU를 다른 프로세스가 쓰고 있으면 중단 → `nvidia-smi base-clocks` 값(1395 MHz)으로 고정 → 30초 이상, 그리고 1395 MHz이고 70°C 이하이고 thermal과 power 제한이 없을 때까지 대기(`origin/main` `cool_before_measurement`와 같은 방식) → 실행. 실행 중 telemetry를 1초마다 보고 thermal, power, `hw_slowdown`, `sync_boost` flag나 1395 MHz가 아닌 SM clock이 보이면 바로 kill하고 식힌 뒤 다시 실행(최대 3회), GPU 사용률이 10분(`DIFFKV_STUCK_S`, 지난 정상 실행의 최장 0% 구간은 엔진 초기화 327초) 동안 0%면 kill하고 exit 5 → 끝난 실행 구간 전체를 같은 기준으로 다시 판정해 valid가 아니면 식힌 뒤 다시 실행. 결과 디렉터리에 `gpu_telemetry.jsonl`, `clock_check.json`, `cpu_time.json`, kill한 경우 `throttled.json` 또는 `stuck.json`
+- `cpu_time.json`: 실행마다 한 줄, 그 실행 동안 쓴 CPU 시간(ms) → `command` 측정 명령의 container, `watcher` watcher(`check_throttle.py watch`) container, `watcher_host` watcher를 띄운 host 쪽 `run_docker.sh`와 docker client, `poll_loop` `lock_clock.sh`가 1초마다 kill 조건을 확인하는 loop와 그 loop의 `sleep`, `recorder` recorder(`record_telemetry.py`) container
+- `cpu_time.json` 값 출처: container는 docker cgroup의 `cpuacct.usage`(측정 명령의 container는 끝나면 cgroup이 사라져서 1초마다 읽은 값 중 마지막 값), host 쪽 process는 `/proc/<pid>/stat`
 
 ### offline serving의 step별 동시 decode 요청 수
 

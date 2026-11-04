@@ -7,8 +7,8 @@
 # cooldown before the run, telemetry, and a rerun when throttled.
 # Usage: run_latency.sh [batch ...]   (default: 1 8 32)
 # Results: attention/logs/<UTC>-latency-b<batch>/
-#   source_hashes.json, gpu_telemetry.jsonl, clock_check.json, latency.json,
-#   console.log
+#   source_hashes.json, gpu_telemetry.jsonl, clock_check.json, cpu_time.json,
+#   latency.json, console.log
 # DIFFKV_GPU picks the GPU (default 0).
 set -euo pipefail
 
