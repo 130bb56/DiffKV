@@ -75,7 +75,7 @@ repo 루트에서 실행합니다.
 | SM clock | 고정 안 함 | 1395 MHz 고정 | 1395 MHz 고정 |
 | GPU telemetry | 없음 | 200 ms 간격 | 200 ms 간격 |
 
-- 엔진 설정: eager, chunked prefill on, async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
+- 엔진 설정 (모든 backend 같음): eager, chunked prefill off (prompt 전체를 한 step에서 처리, DiffKV는 `prompt_prefill`), async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
 - clock 고정은 docker(`--cap-add=SYS_ADMIN`)로 `nvidia-smi -lgc 1395,1395` 실행
