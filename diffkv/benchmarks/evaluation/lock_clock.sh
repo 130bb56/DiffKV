@@ -11,17 +11,20 @@
 #      locked, the GPU is at most DIFFKV_COOL_MAX_C (default 70) C and no thermal
 #      or power limit is active; give up after DIFFKV_COOL_TIMEOUT_S (default
 #      1800) seconds
-#   5. run the command; kill it if GPU utilization stays 0% for DIFFKV_STUCK_S
-#      (default 600) seconds (the container named by DIFFKV_CIDFILE when the
-#      command starts one through run_docker.sh)
-#   6. check the command's interval (check_throttle.py); if it is not valid, go
-#      back to 4, at most DIFFKV_LOCK_ATTEMPTS (default 3) runs in total
+#   5. run the command while check_throttle.py watch follows the telemetry,
+#      and kill it (the container named by DIFFKV_CIDFILE when the command
+#      starts one through run_docker.sh) as soon as a sample is throttled or off
+#      the locked clock, or once GPU utilization stays 0% for DIFFKV_STUCK_S
+#      (default 600) seconds
+#   6. check the run's interval (check_throttle.py check); if it was killed for
+#      throttling or is not valid, go back to 3, at most DIFFKV_LOCK_ATTEMPTS
+#      (default 3) runs in total
 # The clock is unlocked on exit.
 # Usage: lock_clock.sh <run_dir> <command> [args...]
 # Results in run_dir: gpu_telemetry.jsonl, clock_check.json (one verdict per
-# run), stuck.json (only when the command was killed)
+# run), throttled.json (the sample that killed the last run) or stuck.json
 # Exit status: the command's status if it fails, 3 if the GPU is in use or does
-# not cool down, 4 if every run was throttled, 5 if the command was killed.
+# not cool down, 4 if every run was throttled, 5 if the command was stuck.
 # DIFFKV_GPU picks the GPU (default 0).
 set -euo pipefail
 
@@ -67,24 +70,31 @@ until [ -s "$telemetry" ]; do
   sleep 1
 done
 
-admin_smi -lgc "$clock,$clock"
 for attempt in $(seq 1 "$attempts"); do
+  admin_smi -lgc "$clock,$clock"
   "${run_docker[@]}" python "$here/check_throttle.py" wait \
     --telemetry "$telemetry" --clock "$clock" --min-seconds "$min_cool" \
     --max-temp "$max_temp" --timeout "$cool_timeout" || exit 3
   echo "lock_clock: run $attempt of $attempts at $clock MHz"
   cidfile="$run_dir/command.cid"
-  rm -f "$cidfile" "$run_dir/stuck.json"
+  rm -f "$cidfile" "$run_dir/throttled.json" "$run_dir/stuck.json"
   start=$(date +%s.%N)
   DIFFKV_CIDFILE="$cidfile" "$@" &
   command=$!
-  "${run_docker[@]}" python "$here/check_throttle.py" idle \
-    --telemetry "$telemetry" --start "$start" --seconds "$stuck_s" \
-    --marker "$run_dir/stuck.json" &
+  "${run_docker[@]}" python "$here/check_throttle.py" watch \
+    --telemetry "$telemetry" --start "$start" --clock "$clock" \
+    --idle-seconds "$stuck_s" --throttle-marker "$run_dir/throttled.json" \
+    --stuck-marker "$run_dir/stuck.json" &
   watcher=$!
+  killed=
   while kill -0 "$command" 2>/dev/null; do
-    if [ -e "$run_dir/stuck.json" ]; then
-      echo "lock_clock: GPU idle for $stuck_s s, killing the command"
+    if [ -e "$run_dir/throttled.json" ]; then
+      killed="throttled or off clock"
+    elif [ -e "$run_dir/stuck.json" ]; then
+      killed="GPU idle for $stuck_s s"
+    fi
+    if [ -n "$killed" ]; then
+      echo "lock_clock: $killed, killing the command"
       if [ -s "$cidfile" ]; then
         docker kill "$(cat "$cidfile")" > /dev/null || true
       else
@@ -92,7 +102,7 @@ for attempt in $(seq 1 "$attempts"); do
       fi
       break
     fi
-    sleep 2
+    sleep 1
   done
   status=0
   wait "$command" || status=$?
@@ -101,11 +111,11 @@ for attempt in $(seq 1 "$attempts"); do
   wait "$watcher" 2>/dev/null || true
   rm -f "$cidfile"
   [ ! -e "$run_dir/stuck.json" ] || exit 5
-  [ "$status" -eq 0 ] || exit "$status"
+  [ -n "$killed" ] || [ "$status" -eq 0 ] || exit "$status"
   sleep 1
   if "${run_docker[@]}" python "$here/check_throttle.py" check \
       --telemetry "$telemetry" --start "$start" --end "$end" --clock "$clock" \
-      --output "$run_dir/clock_check.json"; then
+      --output "$run_dir/clock_check.json" && [ -z "$killed" ]; then
     exit 0
   fi
   echo "lock_clock: run $attempt was throttled or off clock"

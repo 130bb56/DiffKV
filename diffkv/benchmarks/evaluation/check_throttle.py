@@ -12,8 +12,10 @@ is valid when every sample in it runs at --clock MHz, no thermal, power,
 hardware slowdown or sync boost limit is active, and no gap between samples
 (including the nearest sample outside each end) exceeds MAX_GAP_S. Exit 0 if
 valid, 1 if not.
-idle: block until GPU utilization has been 0% in every sample of the last
---seconds after --start, then write --marker and exit 0.
+watch: follow the telemetry from --start while the command runs. Write
+--throttle-marker and exit as soon as a sample shows one of those limits or an
+SM clock other than --clock; write --stuck-marker and exit once GPU utilization
+has been 0% for --idle-seconds.
 """
 
 import argparse
@@ -34,6 +36,7 @@ LIMITS = {
     "hw_thermal_slowdown": 0x40,
     "hw_power_brake_slowdown": 0x80,
 }
+LIMIT_BITS = sum(LIMITS.values())
 COOLING_LIMITS = 0x4 | 0x20 | 0x40 | 0x80
 MAX_GAP_S = 1.0
 
@@ -134,21 +137,32 @@ def check(args):
     return 0 if verdict["valid"] else 1
 
 
-def idle(args):
-    while True:
-        samples = [
-            s
-            for s in read_samples(args.telemetry)
-            if s["epoch"] >= args.start and "error" not in s
-        ]
-        if samples and samples[-1]["epoch"] - args.start >= args.seconds:
-            since = samples[-1]["epoch"] - args.seconds
-            if all(s["utilization_pct"] == 0 for s in samples if s["epoch"] >= since):
-                note = {"idle_since_epoch": since, "seconds": args.seconds}
-                Path(args.marker).write_text(json.dumps(note) + "\n")
-                print(f"GPU idle for {args.seconds:.0f} s", flush=True)
-                return 0
-        time.sleep(5)
+def watch(args):
+    last_busy = args.start
+    pending = ""
+    with open(args.telemetry) as telemetry:
+        while True:
+            pending += telemetry.read()
+            *lines, pending = pending.split("\n")
+            for line in lines:
+                try:
+                    sample = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if sample["epoch"] < args.start or "error" in sample:
+                    continue
+                if sample["reasons"] & LIMIT_BITS or sample["sm_mhz"] != args.clock:
+                    Path(args.throttle_marker).write_text(json.dumps(sample) + "\n")
+                    print(f"throttled or off clock: {json.dumps(sample)}", flush=True)
+                    return 0
+                if sample["utilization_pct"] > 0:
+                    last_busy = sample["epoch"]
+                elif sample["epoch"] - last_busy >= args.idle_seconds:
+                    note = {"idle_since_epoch": last_busy, "seconds": args.idle_seconds}
+                    Path(args.stuck_marker).write_text(json.dumps(note) + "\n")
+                    print(f"GPU idle for {args.idle_seconds:.0f} s", flush=True)
+                    return 0
+            time.sleep(1)
 
 
 def main():
@@ -166,15 +180,17 @@ def main():
     checking.add_argument("--end", type=float, required=True)
     checking.add_argument("--clock", type=int, required=True)
     checking.add_argument("--output", required=True)
-    idling = commands.add_parser("idle")
-    idling.add_argument("--telemetry", required=True)
-    idling.add_argument("--start", type=float, required=True)
-    idling.add_argument("--seconds", type=float, required=True)
-    idling.add_argument("--marker", required=True)
+    watching = commands.add_parser("watch")
+    watching.add_argument("--telemetry", required=True)
+    watching.add_argument("--start", type=float, required=True)
+    watching.add_argument("--clock", type=int, required=True)
+    watching.add_argument("--idle-seconds", type=float, required=True)
+    watching.add_argument("--throttle-marker", required=True)
+    watching.add_argument("--stuck-marker", required=True)
     args = parser.parse_args()
     # In a container this runs as PID 1, which ignores SIGTERM without a handler.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    sys.exit({"wait": wait, "check": check, "idle": idle}[args.command](args))
+    sys.exit({"wait": wait, "check": check, "watch": watch}[args.command](args))
 
 
 if __name__ == "__main__":
