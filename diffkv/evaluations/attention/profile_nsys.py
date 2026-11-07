@@ -377,7 +377,8 @@ def main():
     trace.add_argument(
         "--output",
         type=Path,
-        help="default: logs/<UTC>-nsys-b<batch>-kv<context>/cuda_events.json",
+        help="default: logs/attention/<UTC>-nsys-b<batch>-kv<context>/"
+        "cuda_events.json",
     )
     attribute = commands.add_parser(
         "analyze", help="attribute kernels in an exported SQLite trace"
@@ -402,7 +403,10 @@ def main():
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         name = f"{stamp}-nsys-b{args.batch}-kv{args.context}"
         args.output = (
-            Path(__file__).resolve().parent / "logs" / name / "cuda_events.json"
+            Path(__file__).resolve().parents[1]
+            / "logs/attention"
+            / name
+            / "cuda_events.json"
         )
     if min(args.batch, args.context, args.iterations) < 1:
         trace.error("Batch, context and iterations must be positive")

@@ -44,7 +44,7 @@ worktree_mount=()
 if [ "$primary_repo" != "$diffkv_repo" ]; then
   worktree_mount=(-v "$primary_repo:$primary_repo:ro"
     -v "$primary_repo/.cache:$primary_repo/.cache"
-    -e "PYTHONPATH=$diffkv_repo/diffkv/python:$diffkv_repo/diffkv/benchmarks:$diffkv_repo")
+    -e "PYTHONPATH=$diffkv_repo/diffkv/python:$diffkv_repo/diffkv/evaluations:$diffkv_repo")
 fi
 
 exec docker run --rm --gpus "\"device=${DIFFKV_GPU:-0}\"" --ipc=host \

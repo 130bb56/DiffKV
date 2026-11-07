@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Score MATH-500 outputs: extract each final answer and check it against the reference.
+"""Score MATH-500 or GPQA-diamond outputs against the reference answers.
 
-Answer extraction and equivalence checking are copied without behavior changes
+Both benchmarks search only the text after the last </think>.
+
+GPQA-diamond: simple-evals gpqa_eval.py's extraction, the first match of
+ANSWER_PATTERN_MULTICHOICE, compared with the reference letter as matched.
+
+MATH-500: answer extraction and equivalence checking are copied without behavior changes
 from the Qwen2.5-Math evaluation code (https://github.com/QwenLM/Qwen2.5-Math),
 as archived in DiffKV commit c489dc1 under vllm/dataset/math_parser.py and
 vllm/dataset/math_grader.py. That grader is largely copied from the Hendrycks
@@ -25,8 +30,8 @@ from pathlib import Path
 import regex
 import regex as re
 import timeout_decorator
-from latex2sympy2 import latex2sympy
-from math500.generation_utils import (
+from generation.generation_utils import (
+    GPQA_DIAMOND_197,
     PROBLEMS,
     load_workload,
     read_json,
@@ -34,6 +39,7 @@ from math500.generation_utils import (
     save_json,
     sha256,
 )
+from latex2sympy2 import latex2sympy
 from sympy import N, simplify
 from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
@@ -959,7 +965,7 @@ def normalize_decoration(text):
     return text.rstrip(".")
 
 
-def grade_one(text, reference):
+def grade_math500(text, reference):
     final = text.rsplit("</think>", 1)[-1]
     captured = io.StringIO()
     error = None
@@ -1010,9 +1016,28 @@ def grade_one(text, reference):
     }
 
 
-def grade_run(workload, run):
+# simple-evals common.ANSWER_PATTERN_MULTICHOICE, unchanged.
+ANSWER_PATTERN = r"(?i)Answer[ \t]*:[ \t]*\$?([A-D])\$?"
+
+
+def grade_gpqa(text, reference):
+    match = re.search(ANSWER_PATTERN, text.rsplit("</think>", 1)[-1])
+    prediction = match.group(1) if match else None
+    return {
+        "prediction": prediction,
+        "reference": reference,
+        "correct": prediction == reference,
+        "answer_missing": prediction is None,
+    }
+
+
+GRADERS = {"math500": grade_math500, "gpqa": grade_gpqa}
+
+
+def grade_run(workload, run, benchmark):
     if run["metadata"]["mode"] != "natural":
         raise ValueError("Fixed-length replay is excluded from correctness")
+    grade = GRADERS[benchmark]
     outputs = {row["request_id"]: row for row in run["requests"]}
     rows = []
     for request in workload["requests"]:
@@ -1020,56 +1045,74 @@ def grade_run(workload, run):
         rows.append(
             {
                 "request_id": request["request_id"],
-                **grade_one(output["output_text"], request["answer"]),
+                **grade(output["output_text"], request["answer"]),
                 "finish_reason": output["finish_reason"],
                 "output_tokens": output["output_tokens"],
             }
         )
-    errors = sum(row["grading_error"] is not None for row in rows)
-    raw_correct = sum(row["raw_correct"] for row in rows)
+    count = len(rows)
     correct = sum(row["correct"] for row in rows)
-    return {
-        "count": len(rows),
-        "raw_correct": raw_correct,
-        "correct": correct,
-        "raw_accuracy": raw_correct / len(rows) if not errors else None,
-        "accuracy": correct / len(rows) if not errors else None,
-        "grading_errors": errors,
-        "answer_missing": sum(row["answer_missing"] for row in rows),
-        "length_capped": sum(row["finish_reason"] == "length" for row in rows),
-        "corrections": [row for row in rows if row["correction"]],
-        "requests": rows,
-    }
+    if benchmark == "math500":
+        errors = sum(row["grading_error"] is not None for row in rows)
+        raw_correct = sum(row["raw_correct"] for row in rows)
+        result = {
+            "count": count,
+            "raw_correct": raw_correct,
+            "correct": correct,
+            "raw_accuracy": raw_correct / count if not errors else None,
+            "accuracy": correct / count if not errors else None,
+            "grading_errors": errors,
+        }
+    else:
+        result = {"count": count, "correct": correct, "accuracy": correct / count}
+    result["answer_missing"] = sum(row["answer_missing"] for row in rows)
+    result["length_capped"] = sum(row["finish_reason"] == "length" for row in rows)
+    if benchmark == "math500":
+        result["corrections"] = [row for row in rows if row["correction"]]
+    result["requests"] = rows
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--benchmark", choices=tuple(GRADERS), required=True)
     parser.add_argument(
         "--outputs", type=Path, required=True, help="outputs.json from a natural run"
     )
     parser.add_argument(
-        "--problems", type=Path, help="default: problems/ file for the run's size"
+        "--problems",
+        type=Path,
+        help="default: math500 file of benchmarks/ for the run's size, or "
+        "gpqa_diamond_197.json",
     )
     parser.add_argument("--output", type=Path, help="default: grades.json beside it")
     args = parser.parse_args()
     run = read_json(args.outputs)
     count = len(run["requests"])
-    problems = args.problems or PROBLEMS[count]
+    problems = args.problems or (
+        PROBLEMS[count] if args.benchmark == "math500" else GPQA_DIAMOND_197
+    )
     workload = load_workload(problems, count)
     if run["metadata"]["request_signature"] != request_signature(workload):
         raise ValueError("Outputs were generated from different problems")
     output = args.output or args.outputs.with_name("grades.json")
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
-    result = grade_run(workload, run)
+    result = grade_run(workload, run, args.benchmark)
     result["artifacts"] = {
         name: {"path": str(path.resolve()), "sha256": sha256(path)}
         for name, path in (("problems", problems), ("outputs", args.outputs))
     }
     save_json(output, result)
+    counts = f"correct {result['correct']}/{result['count']}"
+    if args.benchmark == "math500":
+        counts += (
+            f" (raw {result['raw_correct']}), "
+            f"grading errors {result['grading_errors']}"
+        )
     print(
-        f"correct {result['correct']}/{result['count']} "
-        f"(raw {result['raw_correct']}), grading errors {result['grading_errors']}"
+        f"{counts}, answer missing {result['answer_missing']}, "
+        f"length capped {result['length_capped']}"
     )
     print(f"Saved {output}")
 

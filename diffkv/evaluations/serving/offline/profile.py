@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split nsys-traced engine steps into GPU kernel time, GPU idle time and syncs.
+"""Analyze the Nsight Systems or Nsight Compute profile of an offline serving run.
 
-Reads the trace.sqlite and outputs.json of a run_offline_serving.sh run with
-DIFFKV_NSYS_STEPS. Each NVTX range step/<n> covers one LLMEngine.step() on the
-CPU; the GPU kernels, copies and memsets launched inside the range belong to
+nsys: split nsys-traced engine steps into GPU kernel time, GPU idle time and
+syncs. Reads the trace.sqlite and outputs.json of a run_offline_serving.sh run
+with DIFFKV_NSYS_STEPS. Each NVTX range step/<n> covers one LLMEngine.step() on
+the CPU; the GPU kernels, copies and memsets launched inside the range belong to
 that step.
+
+ncu: average Nsight Compute metrics per kernel over the profiled engine steps.
+Reads kernels_raw.csv (`ncu --import ... --csv --page raw --print-units base`)
+from a run_offline_serving.sh DIFFKV_NCU_STEPS run. Each kernel runs once per
+layer in each step; the summary averages all its instances.
 """
 
 import argparse
 import bisect
+import csv
 import json
 import sqlite3
 import statistics
@@ -42,6 +49,27 @@ CATEGORIES = (
     ("activation", ("act_and_mul",)),
     ("index_gather_scatter", ("index", "gather", "scatter")),
 )
+METRICS = (
+    "gpu__time_duration.sum",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
+    "lts__t_sector_hit_rate.pct",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "sm__maximum_warps_per_active_cycle_pct",
+    "launch__registers_per_thread",
+    "launch__grid_size",
+    "launch__block_size",
+    "launch__shared_mem_per_block_static",
+    "launch__shared_mem_per_block_dynamic",
+    "smsp__issue_active.avg.pct_of_peak_sustained_active",
+    "smsp__warps_eligible.avg.per_cycle_active",
+    "smsp__inst_executed.sum",
+)
+STALL = re.compile(r"smsp__average_warps_issue_stalled_(\w+)_per_issue_active\.ratio")
+PIPE = re.compile(r"sm__inst_executed_pipe_(\w+)\.avg\.pct_of_peak_sustained_active")
+NAME = re.compile(r"(?:^|\s)([\w:]+)\s*(?:<|\()")
 
 
 def category(short_name, demangled):
@@ -78,7 +106,7 @@ def summary(values):
     }
 
 
-def analyze(trace, outputs_path):
+def analyze_nsys(trace, outputs_path):
     connection = sqlite3.connect(trace.resolve().as_uri() + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master")}
@@ -257,32 +285,101 @@ def analyze(trace, outputs_path):
     }
 
 
+def number(text):
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def short_name(name):
+    match = NAME.search(name)
+    return match[1].split("::")[-1] if match else name
+
+
+def analyze_ncu(raw_path, outputs_path):
+    lines = raw_path.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if '"Kernel Name"' in line)
+    rows = list(csv.reader(lines[start:]))
+    header, units, data = rows[0], rows[1], rows[2:]
+    columns = {name: index for index, name in enumerate(header)}
+    selected = [m for m in METRICS if m in columns]
+    selected += [m for m in header if STALL.fullmatch(m) or PIPE.fullmatch(m)]
+    kernels = defaultdict(list)
+    for row in data:
+        if len(row) != len(header):
+            continue
+        kernels[short_name(row[columns["Kernel Name"]])].append(row)
+    if not kernels:
+        raise ValueError(f"No kernel rows in {raw_path}")
+    means_by_kernel = {}
+    for name, instances in sorted(kernels.items()):
+        means = {}
+        for metric in selected:
+            values = [number(row[columns[metric]]) for row in instances]
+            values = [value for value in values if value is not None]
+            if values:
+                means[metric] = statistics.fmean(values)
+        means_by_kernel[name] = {
+            "instances": len(instances),
+            "units": {m: units[columns[m]] for m in selected if m in means},
+            "mean": means,
+        }
+    profile = None
+    if outputs_path is not None:
+        profile = json.loads(outputs_path.read_text()).get("profile")
+    return {
+        "raw": str(raw_path),
+        "definitions": {
+            "mean": "Mean over the kernel's instances in the profiled steps "
+            "(one per profiled step, decoder layer 0 only)",
+            "stall ratios": "smsp__average_warps_issue_stalled_<reason>_per_issue_"
+            "active.ratio: warps stalled on the reason per issued instruction",
+        },
+        "profile": profile,
+        "kernels": means_by_kernel,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace", type=Path, required=True)
-    parser.add_argument("--outputs", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    nsys = commands.add_parser("nsys", help="per-step breakdown of trace.sqlite")
+    nsys.add_argument("--trace", type=Path, required=True)
+    ncu = commands.add_parser("ncu", help="per-kernel means of kernels_raw.csv")
+    ncu.add_argument("--raw", type=Path, required=True)
+    for command in (nsys, ncu):
+        command.add_argument("--outputs", type=Path)
+        command.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
-    report = analyze(args.trace, args.outputs)
+    if args.command == "nsys":
+        report = analyze_nsys(args.trace, args.outputs)
+        mean = report["per_step_mean"]
+        printed = {
+            "steps": report["steps"],
+            "wall_ms": mean["wall_ms"]["mean"],
+            "gpu_busy_ms": mean["gpu_busy_ms"]["mean"],
+            "gpu_idle_ms": mean["gpu_idle_ms"]["mean"],
+            "sync_api_calls": mean["sync_api_calls"]["mean"],
+            "kernel_ms": {k: v["mean"] for k, v in mean["kernel_ms"].items()},
+            "output": str(args.output),
+        }
+    else:
+        report = analyze_ncu(args.raw, args.outputs)
+        printed = {
+            name: {
+                "instances": entry["instances"],
+                "duration_ns": entry["mean"].get("gpu__time_duration.sum"),
+                "dram_pct": entry["mean"].get(
+                    "dram__throughput.avg.pct_of_peak_sustained_elapsed"
+                ),
+            }
+            for name, entry in report["kernels"].items()
+        }
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    mean = report["per_step_mean"]
-    print(
-        json.dumps(
-            {
-                "steps": report["steps"],
-                "wall_ms": mean["wall_ms"]["mean"],
-                "gpu_busy_ms": mean["gpu_busy_ms"]["mean"],
-                "gpu_idle_ms": mean["gpu_idle_ms"]["mean"],
-                "sync_api_calls": mean["sync_api_calls"]["mean"],
-                "kernel_ms": {k: v["mean"] for k, v in mean["kernel_ms"].items()},
-                "output": str(args.output),
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
+    print(json.dumps(printed, indent=2), flush=True)
 
 
 if __name__ == "__main__":
