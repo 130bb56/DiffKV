@@ -6,6 +6,10 @@
 # one run per batch size. Prompt lengths come from benchmark_prefill.py
 # defaults (256 1024) unless DIFFKV_PROMPTS is set. DIFFKV_PREFILL_PARTS=1 also
 # times prompt_prefill's attention, score and compression launches.
+# DIFFKV_CONFIGS="<name> ..." times only those configs (diffkv_serving, diffkv,
+# fa2_fp16, flashinfer_fp8) and adds their names to the directory. Splitting the
+# configs over GPUs this way compares separate processes on separate devices,
+# not one process on one device.
 # Each run goes through utils/lock_clock.sh: SM clock locked to the base clock,
 # cooldown before the run, telemetry, and a rerun when throttled.
 # Usage: run_prefill.sh [batch ...]   (default: 1 8 32)
@@ -39,9 +43,14 @@ if [ "${DIFFKV_PREFILL_PARTS:-0}" = 1 ]; then
   extra+=(--parts)
 fi
 suffix=
+if [ -n "${DIFFKV_CONFIGS:-}" ]; then
+  # shellcheck disable=SC2206
+  extra+=(--configs ${DIFFKV_CONFIGS})
+  suffix="-${DIFFKV_CONFIGS// /-}"
+fi
 sys_admin=0
 if [ -n "${DIFFKV_NCU_KERNEL:-}" ]; then
-  suffix=-ncu
+  suffix="$suffix-ncu"
   sys_admin=1
 fi
 

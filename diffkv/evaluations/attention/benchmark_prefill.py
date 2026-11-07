@@ -402,7 +402,7 @@ def make_fp8(batch, prompt, kv_heads):
     )
 
 
-ARMS = {
+CONFIGS = {
     "diffkv_serving": make_diffkv_serving,
     "diffkv": make_diffkv,
     "fa2_fp16": make_fa2,
@@ -422,6 +422,14 @@ def main():
         help="also time prompt_prefill's attention, score and compression launches",
     )
     parser.add_argument(
+        "--configs",
+        nargs="+",
+        choices=list(CONFIGS),
+        default=list(CONFIGS),
+        help="configs to time; the default times all of them in one process, "
+        "which is the only way to compare them on one device",
+    )
+    parser.add_argument(
         "--output", type=Path, help="default: logs/<UTC>-prefill-b<batch>/latency.json"
     )
     args = parser.parse_args()
@@ -439,7 +447,8 @@ def main():
     rows = []
     for prompt in args.prompts:
         configs = {
-            name: make(args.batch, prompt, args.kv_heads) for name, make in ARMS.items()
+            name: CONFIGS[name](args.batch, prompt, args.kv_heads)
+            for name in args.configs
         }
         if args.parts:
             configs.update(make_diffkv_parts(args.batch, prompt, args.kv_heads))
@@ -451,24 +460,24 @@ def main():
                 measure(config.function, config.arguments, args.repeat_ms)
             )
         medians = {name: statistics.median(values) for name, values in samples.items()}
-        rows.append(
-            {
-                "batch": args.batch,
-                "prompt": prompt,
-                "kv_heads": args.kv_heads,
-                "cuda_graph": False,
-                "configs": {
-                    name: {
-                        "details": config.details,
-                        "cache_object_bytes": config.cache_bytes,
-                        "median_us": medians[name],
-                        "samples_us": samples[name],
-                    }
-                    for name, config in configs.items()
-                },
-                "diffkv_over_fp8_ratio": medians["diffkv"] / medians["flashinfer_fp8"],
-            }
-        )
+        row = {
+            "batch": args.batch,
+            "prompt": prompt,
+            "kv_heads": args.kv_heads,
+            "cuda_graph": False,
+            "configs": {
+                name: {
+                    "details": config.details,
+                    "cache_object_bytes": config.cache_bytes,
+                    "median_us": medians[name],
+                    "samples_us": samples[name],
+                }
+                for name, config in configs.items()
+            },
+        }
+        if {"diffkv", "flashinfer_fp8"} <= medians.keys():
+            row["diffkv_over_fp8_ratio"] = medians["diffkv"] / medians["flashinfer_fp8"]
+        rows.append(row)
         print(json.dumps({"prompt": prompt, "median_us": medians}), flush=True)
         del configs
         torch.accelerator.empty_cache()
@@ -488,6 +497,7 @@ def main():
         "off): attention plus writing the prompt KV into each config's cache",
         "comparison_scope": "one layer for one step; no accuracy check here "
         "(correctness.py checks diffkv against diffkv_serving)",
+        "configs_timed": list(args.configs),
         "excluded": [
             "cache allocation",
             "request admission",

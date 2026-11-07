@@ -273,6 +273,13 @@ def main():
         help="FP8 configs to add; pass no value to compare only DiffKV and FA2",
     )
     parser.add_argument(
+        "--configs",
+        nargs="+",
+        choices=["diffkv", "fa2_fp16", "fp8", "fp8_cuda"],
+        help="configs to time; by default every built config is timed in one "
+        "process, which is the only way to compare them on one device",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="default: logs/attention/<UTC>-latency-b<batch>/latency.json",
@@ -355,6 +362,12 @@ def main():
         }
         for candidate in args.candidates:
             configs[candidate] = _make_fp8(fixture, dense_args, candidate == "fp8")
+        if args.configs is not None:
+            configs = {
+                name: config for name, config in configs.items() if name in args.configs
+            }
+            if not configs:
+                parser.error("No built config matches --configs")
         samples = {name: [] for name in configs}
         order = list(configs)
         for name in [*order, *reversed(order)]:
@@ -369,6 +382,9 @@ def main():
             * args.kv_heads
             * (high * (128 + 64 + 8 + 8) + low * (64 + 32 + 8 + 8)),
             "fa2_fp16": args.batch * args.kv_heads * context * HEAD_SIZE * 2 * 2,
+        }
+        minimum_kv_bytes = {
+            name: value for name, value in minimum_kv_bytes.items() if name in medians
         }
         row = {
             "batch": args.batch,
@@ -389,7 +405,6 @@ def main():
                 }
                 for name, config in configs.items()
             },
-            "fa2_over_diffkv_ratio": medians["fa2_fp16"] / medians["diffkv"],
             "minimum_kv_bytes": minimum_kv_bytes,
             "effective_minimum_kv_gbps": {
                 name: value / (medians[name] * 1000)
@@ -397,11 +412,17 @@ def main():
             },
         }
         summary = {"context": context, "median_us": medians}
-        if args.candidates:
-            winner = min(args.candidates, key=medians.__getitem__)
+        if {"fa2_fp16", "diffkv"} <= medians.keys():
+            row["fa2_over_diffkv_ratio"] = medians["fa2_fp16"] / medians["diffkv"]
+        tested_fp8 = [name for name in args.candidates if name in medians]
+        if tested_fp8:
+            winner = min(tested_fp8, key=medians.__getitem__)
             row["fastest_tested_fp8"] = winner
-            row["fastest_fp8_over_diffkv_ratio"] = medians[winner] / medians["diffkv"]
             summary["fastest_tested_fp8"] = winner
+            if "diffkv" in medians:
+                row["fastest_fp8_over_diffkv_ratio"] = (
+                    medians[winner] / medians["diffkv"]
+                )
         rows.append(row)
         print(json.dumps(summary), flush=True)
     report = {
@@ -422,6 +443,7 @@ def main():
             "identical retained KV before FP8 quantization, kernel only; "
             "no pruning or serving speedup claim"
         ),
+        "configs_timed": sorted(rows[0]["configs"]) if rows else [],
         "oracle": "full FP64 softmax of actual native dequantized cache",
         "excluded": [
             "cache writer",
