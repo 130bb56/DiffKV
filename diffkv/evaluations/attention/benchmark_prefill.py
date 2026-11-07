@@ -4,7 +4,7 @@
 
 One step holds `batch` requests whose prompts of `prompt` tokens are all
 processed in that step. Query, key and value are views of one QKV projection
-output, as the vLLM attention layer receives them. Every arm includes writing
+output, as the vLLM attention layer receives them. Every config includes writing
 the prompt's KV into its cache:
 
 - diffkv_serving: the current DiffKV backend path (backend.py), per request:
@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from attention.benchmark_latency import BLOCK_SIZE, Arm, measure, timing_backend
+from attention.benchmark_latency import BLOCK_SIZE, Config, measure, timing_backend
 from attention.correctness import (
     HEAD_SIZE,
     LAYER_IDX,
@@ -144,7 +144,7 @@ def make_diffkv_serving(batch, prompt, kv_heads):
         serving_prefill(controller, request_ids, bounds, q, k, v, output)
 
     run(query, key, value)
-    return Arm(
+    return Config(
         run,
         (query, key, value),
         output,
@@ -191,7 +191,7 @@ def make_diffkv(batch, prompt, kv_heads):
         )
 
     run(query, key, value)
-    return Arm(
+    return Config(
         run,
         (query, key, value),
         output,
@@ -210,7 +210,7 @@ def make_diffkv(batch, prompt, kv_heads):
 
 
 def make_diffkv_parts(batch, prompt, kv_heads):
-    """prompt_prefill's three launches as separate arms, on the same inputs."""
+    """prompt_prefill's three launches as separate configs, on the same inputs."""
     from diffkv.prefill import compress_prompts, prompt_attention, prompt_scores
 
     lengths = [prompt] * batch
@@ -249,7 +249,7 @@ def make_diffkv_parts(batch, prompt, kv_heads):
         "diffkv_part_compress": (compress, (key, value, scores), "compress_prompts"),
     }
     return {
-        name: Arm(
+        name: Config(
             function,
             arguments,
             output,
@@ -312,7 +312,7 @@ def make_fa2(batch, prompt, kv_heads):
         )
 
     run(query, key, value)
-    return Arm(
+    return Config(
         run,
         (query, key, value),
         output,
@@ -381,7 +381,7 @@ def make_fp8(batch, prompt, kv_heads):
         )
 
     run(query, key, value)
-    return Arm(
+    return Config(
         run,
         (query, key, value),
         output,
@@ -438,16 +438,18 @@ def main():
     extension = get_extension()
     rows = []
     for prompt in args.prompts:
-        arms = {
+        configs = {
             name: make(args.batch, prompt, args.kv_heads) for name, make in ARMS.items()
         }
         if args.parts:
-            arms.update(make_diffkv_parts(args.batch, prompt, args.kv_heads))
-        samples = {name: [] for name in arms}
-        order = list(arms)
+            configs.update(make_diffkv_parts(args.batch, prompt, args.kv_heads))
+        samples = {name: [] for name in configs}
+        order = list(configs)
         for name in [*order, *reversed(order)]:
-            arm = arms[name]
-            samples[name].extend(measure(arm.function, arm.arguments, args.repeat_ms))
+            config = configs[name]
+            samples[name].extend(
+                measure(config.function, config.arguments, args.repeat_ms)
+            )
         medians = {name: statistics.median(values) for name, values in samples.items()}
         rows.append(
             {
@@ -455,20 +457,20 @@ def main():
                 "prompt": prompt,
                 "kv_heads": args.kv_heads,
                 "cuda_graph": False,
-                "arms": {
+                "configs": {
                     name: {
-                        "details": arm.details,
-                        "cache_object_bytes": arm.cache_bytes,
+                        "details": config.details,
+                        "cache_object_bytes": config.cache_bytes,
                         "median_us": medians[name],
                         "samples_us": samples[name],
                     }
-                    for name, arm in arms.items()
+                    for name, config in configs.items()
                 },
                 "diffkv_over_fp8_ratio": medians["diffkv"] / medians["flashinfer_fp8"],
             }
         )
         print(json.dumps({"prompt": prompt, "median_us": medians}), flush=True)
-        del arms
+        del configs
         torch.accelerator.empty_cache()
     report = {
         "status": "completed",
@@ -483,7 +485,7 @@ def main():
         "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
         "flashinfer_extra_cudaflags": os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS"),
         "operation": "prefill of one layer for whole prompts (chunked prefill "
-        "off): attention plus writing the prompt KV into each arm's cache",
+        "off): attention plus writing the prompt KV into each config's cache",
         "comparison_scope": "one layer for one step; no accuracy check here "
         "(correctness.py checks diffkv against diffkv_serving)",
         "excluded": [

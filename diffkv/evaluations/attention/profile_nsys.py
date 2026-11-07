@@ -78,7 +78,7 @@ def profile(args):
     )
     fp8 = _make_fp8(fixture, dense_args)
     correctness["fp8"] = fp8.correctness
-    arms = {
+    configs = {
         "diffkv": (extension.ops.sparse_paged_attention_gqa, packed_args),
         "fa2_fp16": (dense, dense_args),
         "fp8": (fp8.function, fp8.arguments),
@@ -88,15 +88,15 @@ def profile(args):
         device="cuda",
         dtype=torch.uint8,
     )
-    order = [*arms, *reversed(arms)]
+    order = [*configs, *reversed(configs)]
     events = {
-        arm: [
+        config: [
             (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             for _ in range(args.iterations * 2)
         ]
-        for arm in arms
+        for config in configs
     }
-    for function, arguments in arms.values():
+    for function, arguments in configs.values():
         for _ in range(25):
             flush.zero_()
             function(*arguments)
@@ -107,19 +107,19 @@ def profile(args):
     torch.accelerator.synchronize()
 
     print("PROFILE START eager, CUDA Graph OFF", flush=True)
-    counters = dict.fromkeys(arms, 0)
+    counters = dict.fromkeys(configs, 0)
     torch.cuda.cudart().cudaProfilerStart()
     try:
-        for arm in order:
-            function, arguments = arms[arm]
+        for config in order:
+            function, arguments = configs[config]
             for _ in range(args.iterations):
-                iteration = counters[arm]
-                counters[arm] += 1
-                start, end = events[arm][iteration]
-                with torch.cuda.nvtx.range(f"flush/{arm}/{iteration}"):
+                iteration = counters[config]
+                counters[config] += 1
+                start, end = events[config][iteration]
+                with torch.cuda.nvtx.range(f"flush/{config}/{iteration}"):
                     flush.zero_()
                 start.record()
-                with torch.cuda.nvtx.range(f"attention/{arm}/{iteration}"):
+                with torch.cuda.nvtx.range(f"attention/{config}/{iteration}"):
                     function(*arguments)
                 end.record()
             torch.accelerator.synchronize()
@@ -128,8 +128,8 @@ def profile(args):
         torch.cuda.cudart().cudaProfilerStop()
 
     samples = {
-        arm: [start.elapsed_time(end) * 1000 for start, end in pairs]
-        for arm, pairs in events.items()
+        config: [start.elapsed_time(end) * 1000 for start, end in pairs]
+        for config, pairs in events.items()
     }
     report = {
         "status": "completed",
@@ -146,7 +146,7 @@ def profile(args):
         "correctness": correctness,
         "event_interval_us": samples,
         "event_interval_p50_us": {
-            arm: statistics.median(values) for arm, values in samples.items()
+            config: statistics.median(values) for config, values in samples.items()
         },
         "scope": "Profiled direct attention calls. Preparation, warmup and L2 "
         "flush excluded from event intervals. Includes tracing and NVTX overhead; "
@@ -186,7 +186,7 @@ def analyze(path, event_path=None):
                 raise ValueError(f"Incomplete NVTX range: {name}")
             ranges.append((match[1], int(match[2]), row))
     if not ranges:
-        raise ValueError("No attention/{arm}/{iteration} NVTX ranges")
+        raise ValueError("No attention/{config}/{iteration} NVTX ranges")
     if len({(a, i) for a, i, _ in ranges}) != len(ranges):
         raise ValueError("Duplicate attention invocation labels")
 
@@ -208,14 +208,14 @@ def analyze(path, event_path=None):
                 launches[row["globalTid"]].append((kind, row))
 
     invocations, attributed_ids = [], set()
-    for arm, iteration, scope in sorted(ranges):
+    for config, iteration, scope in sorted(ranges):
         selected = [
             (kind, api)
             for kind, api in launches[scope["globalTid"]]
             if scope["start"] <= api["start"] and api["end"] <= scope["end"]
         ]
         if not selected:
-            raise ValueError(f"No launch APIs: {arm}/{iteration}")
+            raise ValueError(f"No launch APIs: {config}/{iteration}")
         selected.sort(key=lambda pair: pair[0] != "RUNTIME")
         attributed, matched_apis = {}, {}
         for kind, api in selected:
@@ -227,14 +227,14 @@ def analyze(path, event_path=None):
                     attributed[kernel["_rowid"]] = (kernel, api)
                     matched_apis[kind, api["_rowid"]] = api
         if not attributed:
-            raise ValueError(f"No correlated GPU kernels: {arm}/{iteration}")
+            raise ValueError(f"No correlated GPU kernels: {config}/{iteration}")
         missing = [
             strings[api["nameId"]]
             for _, api in selected
             if not kernels.get((api["globalTid"] & PID_MASK, api["correlationId"]))
         ]
         if missing:
-            raise ValueError(f"Unmatched launch APIs: {arm}/{iteration}: {missing}")
+            raise ValueError(f"Unmatched launch APIs: {config}/{iteration}: {missing}")
         attributed_ids.update(attributed)
 
         details = []
@@ -263,7 +263,7 @@ def analyze(path, event_path=None):
         apis = list(matched_apis.values())
         invocations.append(
             {
-                "arm": arm,
+                "config": config,
                 "iteration": iteration,
                 "kernel_count": len(details),
                 "kernel_sum_us": sum(r["duration_us"] for r in details),
@@ -306,21 +306,21 @@ def analyze(path, event_path=None):
     if event_path is not None:
         events = json.loads(event_path.read_text())["event_interval_us"]
         for row in invocations:
-            values = events[row["arm"]]
+            values = events[row["config"]]
             index = (
                 row["iteration"] if isinstance(values, list) else str(row["iteration"])
             )
             row["cuda_event_interval_us"] = values[index]
             row["event_minus_kernel_union_us"] = values[index] - row["kernel_union_us"]
 
-    arms = {}
-    for arm in sorted({r["arm"] for r in invocations}):
-        samples = [r for r in invocations if r["arm"] == arm]
+    configs = {}
+    for config in sorted({r["config"] for r in invocations}):
+        samples = [r for r in invocations if r["config"] == config]
         grouped = defaultdict(list)
         for row in samples:
             for kernel in row["kernels"]:
                 grouped[kernel["name"]].append(kernel["duration_us"])
-        arms[arm] = {
+        configs[config] = {
             "invocations": len(samples),
             "metrics": {
                 key: {
@@ -328,7 +328,7 @@ def analyze(path, event_path=None):
                     "mean": statistics.mean(row[key] for row in samples),
                 }
                 for key in samples[0]
-                if key not in ("arm", "iteration", "kernels")
+                if key not in ("config", "iteration", "kernels")
             },
             "kernels": [
                 {
@@ -362,7 +362,7 @@ def analyze(path, event_path=None):
             "Internal GPU gap excludes idle time outside the kernel span.",
             "Event minus kernel union is residual time, not isolated CPU overhead.",
         ],
-        "arms": arms,
+        "configs": configs,
         "invocations": invocations,
     }
 
@@ -377,8 +377,7 @@ def main():
     trace.add_argument(
         "--output",
         type=Path,
-        help="default: logs/attention/<UTC>-nsys-b<batch>-kv<context>/"
-        "cuda_events.json",
+        help="default: logs/attention/<UTC>-nsys-b<batch>-kv<context>/cuda_events.json",
     )
     attribute = commands.add_parser(
         "analyze", help="attribute kernels in an exported SQLite trace"

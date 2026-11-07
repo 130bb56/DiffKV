@@ -76,5 +76,5 @@ precedes the start event, followed by direct invocation and the end event; the
 flush is excluded. Host submission gaps may contribute GPU idle time within
 the event interval, so this is eager invocation latency. The report records
 `execution_mode=eager` and `cuda_graph=False`. Input generation, allocation,
-compression, and transfers are excluded. All arms use their production
-configurations without claiming a globally tuned kernel optimum.
+compression, and transfers are excluded. Each config uses its production
+settings without claiming a globally tuned kernel optimum.
