@@ -54,7 +54,8 @@ def engine_options(model, max_tokens):
         "max_num_seqs": 64,
         "gpu_memory_utilization": 0.9,
         "enforce_eager": True,
-        "enable_chunked_prefill": True,
+        # Whole prompts per step; DiffKV prefill runs prompt_prefill on them.
+        "enable_chunked_prefill": False,
         "async_scheduling": False,
         "enable_prefix_caching": False,
         "speculative_config": None,
