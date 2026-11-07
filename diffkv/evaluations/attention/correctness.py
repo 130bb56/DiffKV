@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 HEAD_SIZE = 128
@@ -411,6 +412,294 @@ def metadata(extension):
     }
 
 
+# (prompt lengths, qkv_inputs options). The default inputs keep every token at
+# high precision; query_scale 1.0 makes the writer quantize some tokens and
+# aligned keys (see qkv_inputs) make it prune and quantize many.
+PREFILL_CASES = {
+    "one_prompt": ((256,), {}),
+    "mixed_lengths": ((37, 256, 1024), {}),
+    "kv_buffer_boundary": ((63, 64, 65, 129), {}),
+    "peaked_scores": ((65, 256, 1024), {"query_scale": 1.0}),
+    "aligned_keys": ((65, 256, 1024), {"aligned": 2.0}),
+}
+
+
+def read_region(cache, pages, count, bits):
+    """Per-token records of one region, the inverse of _write_region's layout.
+
+    Returns packed K and V codes, FP16 metadata, scores and positions of the
+    first `count` tokens, plus `order`, their indices sorted by the bytes of
+    position, codes and metadata (positions repeat: the writer stores
+    max(position, prompt_len - 64) for the decode score mean).
+    """
+    k_bits, v_bits, tokens = bits
+    layout = page_layout(k_bits, v_bits, tokens)
+    fields = {"k_packed": [], "v_packed": [], "k_meta": [], "v_meta": []}
+    fields.update(score=[], position=[])
+    for page_idx in range(-(-count // tokens)):
+        page = cache[pages[page_idx].item()]
+        n = min(tokens, count - page_idx * tokens)
+        k_page = page[: tokens * layout.k_packs].reshape(
+            layout.k_packs // 16, tokens, 4, 4
+        )
+        fields["k_packed"].append(
+            k_page.permute(1, 2, 0, 3).reshape(tokens, layout.k_packs)[:n]
+        )
+        v_page = page[
+            layout.value : layout.value + layout.padded_tokens * layout.v_packs
+        ].reshape(layout.v_packs // 8, layout.padded_tokens // 2, 8, 2)
+        fields["v_packed"].append(
+            v_page.permute(1, 3, 2, 0).reshape(layout.padded_tokens, layout.v_packs)[:n]
+        )
+        for name, base in (("k_meta", layout.k_meta), ("v_meta", layout.v_meta)):
+            fields[name].append(page[base : base + 2 * n].reshape(n, 2))
+        fields["score"].append(
+            page.view(torch.float32)[layout.score // 2 : layout.score // 2 + n]
+        )
+        fields["position"].append(
+            page.view(torch.int32)[layout.position // 2 : layout.position // 2 + n]
+        )
+    records = {
+        name: torch.cat(values) if values else torch.empty(0)
+        for name, values in fields.items()
+    }
+    if not count:
+        records["order"] = torch.empty(0, dtype=torch.long)
+        return records
+    rows = torch.cat(
+        [
+            records["position"].view(torch.int16).reshape(-1, 2),
+            *(records[name] for name in ("k_packed", "v_packed", "k_meta", "v_meta")),
+        ],
+        dim=1,
+    ).numpy()
+    records["order"] = torch.from_numpy(np.lexsort(rows.T[::-1]))
+    return records
+
+
+def _unpack(packed, bits):
+    """Codes [tokens, 128] from 16-bit packs holding 16 / bits codes each."""
+    width = 16 // bits
+    packed = packed.to(torch.int64) & 0xFFFF
+    shifts = torch.arange(width, dtype=torch.int64) * bits
+    codes = (packed[:, :, None] >> shifts) & ((1 << bits) - 1)
+    return codes.reshape(packed.shape[0], HEAD_SIZE).double()
+
+
+def check_prompt_writer(controller, slots, lengths, starts, key, value, scores):
+    """Check the prompt-phase writer against an independent reference.
+
+    The token selection is recomputed in FP32 from the scores the writer
+    consumed: mean = score / min(prompt_len - position, 64), pruned below
+    prune_ratio / prompt_len, low precision below quant_ratio / prompt_len,
+    the last 64 tokens always high precision. Every stored token is
+    dequantized and matched to the nearest original token of its precision;
+    the match must be one to one, within half a quantization step plus the
+    FP16 metadata rounding, with the stored score and position field exact.
+    """
+    lengths_table = controller.kv_len_tables[slots, LAYER_IDX].cpu()
+    tables = controller.block_tables[slots, LAYER_IDX].cpu()
+    config = controller.compress_config_tables[slots].cpu()
+    cache = controller.kv_cache.cpu()
+    key, value, scores = key.float().cpu(), value.float().cpu(), scores.cpu()
+    counts = {"high": 0, "low": 0, "pruned": 0}
+    maximum_error_ratio = 0.0
+    for row, length in enumerate(lengths):
+        start = starts[row].item()
+        positions = torch.arange(length)
+        ideal = length - positions
+        base = torch.tensor(1.0, dtype=torch.float32) / length
+        prune, quant = base * config[row, 0], base * config[row, 1]
+        for head in range(scores.shape[1]):
+            score = scores[row, head, :length]
+            mean = score / ideal.clamp(max=64).float()
+            compressible = (ideal > 64) & (length > 64)
+            pruned = compressible & (mean < prune)
+            low = compressible & ~pruned & (mean < quant)
+            high = ~pruned & ~low
+            expected_lengths = [int(high.sum()), int(low.sum())]
+            if lengths_table[row, head].tolist() != expected_lengths:
+                raise AssertionError(
+                    f"Row {row}, KV head {head}: retained lengths "
+                    f"{lengths_table[row, head].tolist()}, expected "
+                    f"{expected_lengths}"
+                )
+            counts["high"] += expected_lengths[0]
+            counts["low"] += expected_lengths[1]
+            counts["pruned"] += int(pruned.sum())
+            high_pages = -(-expected_lengths[0] // 32)
+            regions = (
+                ((8, 4, 32), tables[row, head, :high_pages], high),
+                ((4, 2, 60), tables[row, head, high_pages:], low),
+            )
+            for bits, pages, selected in regions:
+                count = int(selected.sum())
+                if not count:
+                    continue
+                stored = read_region(cache, pages, count, bits)
+                expected_positions = positions[selected]
+                originals = []
+                for tensor in (key, value):
+                    originals.append(tensor[start + expected_positions, head].double())
+                dequantized = []
+                for name, meta_name, field_bits in (
+                    ("k_packed", "k_meta", bits[0]),
+                    ("v_packed", "v_meta", bits[1]),
+                ):
+                    meta = stored[meta_name].view(torch.float16).double()
+                    scale, zero = meta[:, :1], meta[:, 1:]
+                    codes = _unpack(stored[name], field_bits)
+                    dequantized.append((codes * scale + zero, scale, zero, field_bits))
+                deq_key = dequantized[0][0]
+                match = torch.cdist(deq_key, originals[0]).argmin(dim=1)
+                if match.unique().numel() != count:
+                    raise AssertionError(
+                        f"Row {row}, KV head {head}: stored {bits[0]}-bit keys do "
+                        "not match the selected tokens one to one"
+                    )
+                for (values, scale, zero, field_bits), original in zip(
+                    dequantized, originals
+                ):
+                    error = (values - original[match]).abs()
+                    bound = (
+                        scale.abs() * (0.5 + ((1 << field_bits) - 1) * 2**-10)
+                        + zero.abs() * 2**-10
+                        + 1e-6
+                    )
+                    if (error > bound).any():
+                        raise AssertionError(
+                            f"Row {row}, KV head {head}: {bits[0]}-bit token "
+                            "exceeds the quantization error bound"
+                        )
+                    maximum_error_ratio = max(
+                        maximum_error_ratio,
+                        (error / scale.abs().clamp(min=1e-12)).max().item(),
+                    )
+                matched_positions = expected_positions[match]
+                if not torch.equal(stored["score"], score[matched_positions]):
+                    raise AssertionError(
+                        f"Row {row}, KV head {head}: stored scores differ"
+                    )
+                position_field = torch.maximum(
+                    matched_positions, torch.full_like(matched_positions, length - 64)
+                ).to(torch.int32)
+                if not torch.equal(stored["position"], position_field):
+                    raise AssertionError(
+                        f"Row {row}, KV head {head}: stored positions differ"
+                    )
+    return {
+        "writer_tokens": counts,
+        "writer_max_error_over_scale": maximum_error_ratio,
+    }
+
+
+def check_prefill(lengths, inputs, kv_heads=8):
+    """prompt_prefill against the backend prefill path on the same inputs.
+
+    Both paths start from freshly admitted requests. Attention output, the
+    group-maximum scores, retained lengths and every retained token of the
+    layer must agree. Both paths share the prompt-phase writer, so its output
+    is also checked against check_prompt_writer's reference.
+    """
+    from attention.benchmark_prefill import admit_requests, qkv_inputs, serving_prefill
+    from diffkv.prefill import prompt_prefill
+
+    query, key, value, starts = qkv_inputs(lengths, kv_heads, **inputs)
+    reference, request_ids = admit_requests(lengths, kv_heads)
+    candidate, _ = admit_requests(lengths, kv_heads)
+    expected_output = serving_prefill(
+        reference,
+        request_ids,
+        starts.tolist(),
+        query,
+        key,
+        value,
+        torch.empty_like(query),
+    )
+    slots = candidate.metadata(request_ids).slot_ids
+    output, scores = prompt_prefill(
+        query,
+        key,
+        value,
+        starts.cuda(),
+        max(lengths),
+        SCALE,
+        candidate.kv_cache,
+        slots,
+        candidate.block_tables,
+        candidate.kv_len_tables,
+        candidate.compress_config_tables,
+        LAYER_IDX,
+    )
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(output, expected_output, atol=1e-3, rtol=1e-3)
+    maximum_score_error = 0.0
+    for row, (req_id, length) in enumerate(zip(request_ids, lengths)):
+        sums = reference.prompt_scores(req_id)[LAYER_IDX]
+        group_max = sums.view(kv_heads, QUERY_HEADS_PER_KV, length).amax(dim=1)
+        torch.testing.assert_close(
+            scores[row, :, :length], group_max, atol=1e-6, rtol=1e-3
+        )
+        maximum_score_error = max(
+            maximum_score_error,
+            (scores[row, :, :length] - group_max).abs().max().item(),
+        )
+    slots = slots.long()
+    for name in ("block_tables", "kv_len_tables"):
+        if not torch.equal(
+            getattr(reference, name)[slots, LAYER_IDX],
+            getattr(candidate, name)[slots, LAYER_IDX],
+        ):
+            raise AssertionError(f"Prompt compression changed {name}")
+    # The writer places tokens in score order, so near-equal scores from
+    # differently ordered FP32 sums may swap two tokens' slots. Compare each
+    # head's tokens matched by content: payload, metadata and positions bit
+    # for bit, the stored score to tolerance.
+    lengths_table = reference.kv_len_tables[slots, LAYER_IDX].cpu()
+    tables = reference.block_tables[slots, LAYER_IDX].cpu()
+    caches = reference.kv_cache.cpu(), candidate.kv_cache.cpu()
+    maximum_stored_score_error = 0.0
+    tokens_compared = 0
+    for row in range(len(lengths)):
+        for head in range(kv_heads):
+            high, low = lengths_table[row, head].tolist()
+            high_pages = -(-high // 32)
+            regions = (
+                ((8, 4, 32), tables[row, head, :high_pages], high),
+                ((4, 2, 60), tables[row, head, high_pages:], low),
+            )
+            for bits, pages, count in regions:
+                expected, actual = (
+                    read_region(cache, pages, count, bits) for cache in caches
+                )
+                expected, actual = (
+                    {key: value[records["order"]] for key, value in records.items()}
+                    for records in (expected, actual)
+                )
+                for name in ("position", "k_packed", "v_packed", "k_meta", "v_meta"):
+                    if not torch.equal(expected[name], actual[name]):
+                        raise AssertionError(
+                            f"Prompt compression changed {name} of row {row}, "
+                            f"KV head {head}, {bits[0]}-bit keys"
+                        )
+                torch.testing.assert_close(
+                    actual["score"], expected["score"], atol=1e-6, rtol=1e-3
+                )
+                if count:
+                    maximum_stored_score_error = max(
+                        maximum_stored_score_error,
+                        (actual["score"] - expected["score"]).abs().max().item(),
+                    )
+                tokens_compared += count
+    return {
+        "output_max_abs_error": (output - expected_output).abs().max().item(),
+        "score_max_abs_error": maximum_score_error,
+        "stored_score_max_abs_error": maximum_stored_score_error,
+        "tokens_compared": tokens_compared,
+        **check_prompt_writer(candidate, slots, lengths, starts, key, value, scores),
+    }
+
+
 def run_checks(extension):
     cases = {
         "partial_pages": ((33, 61), (95, 119)),
@@ -440,7 +729,21 @@ def run_checks(extension):
             raise AssertionError("Rejected dtype modified cache") from None
     else:
         raise AssertionError("Unsupported FP32 queries were accepted")
-    return {"status": "passed", "metadata": metadata(extension), "cases": results}
+    prefill = [
+        {
+            "name": name,
+            "lengths": lengths,
+            "inputs": inputs,
+            **check_prefill(lengths, inputs),
+        }
+        for name, (lengths, inputs) in PREFILL_CASES.items()
+    ]
+    return {
+        "status": "passed",
+        "metadata": metadata(extension),
+        "cases": results,
+        "prefill_cases": prefill,
+    }
 
 
 def main():
