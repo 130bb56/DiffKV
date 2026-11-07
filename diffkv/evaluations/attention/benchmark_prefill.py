@@ -7,9 +7,6 @@ processed in that step. Query, key and value are views of one QKV projection
 output, as the vLLM attention layer receives them. Every config includes writing
 the prompt's KV into its cache:
 
-- diffkv_serving: the current DiffKV backend path (backend.py), per request:
-  copy KV into the raw prompt buffer, FA2, final-64 query scores with a matmul
-  and softmax per KV head, prompt-phase compression into the packed cache.
 - diffkv: diffkv.prefill.prompt_prefill, one FA2 varlen call returning the
   log-sum-exp, one score kernel and one prompt-phase compression call.
 - fa2_fp16: reshape_and_cache_flash into a paged FP16 cache and paged FA2,
@@ -30,7 +27,6 @@ import os
 import statistics
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 from attention.benchmark_latency import BLOCK_SIZE, Config, measure, timing_backend
@@ -105,62 +101,8 @@ def admit_requests(lengths, kv_heads):
     return controller, request_ids
 
 
-def serving_prefill(controller, request_ids, starts, query, key, value, output):
-    """The DiffKV backend prefill of one layer, prompts complete in this step.
-
-    Mirrors DiffKVImpl.forward for prefill requests with prefix_start 0,
-    including the score reset that begin_request performs.
-    """
-    from diffkv.backend import DiffKVImpl, accumulate_prompt_scores, causal_prefill
-
-    impl = SimpleNamespace(num_kv_heads=key.shape[1])
-    for row, req_id in enumerate(request_ids):
-        start, end = starts[row], starts[row + 1]
-        raw = controller.raw_prompt(req_id)[LAYER_IDX]
-        raw[0].copy_(key[start:end])
-        raw[1].copy_(value[start:end])
-        output[start:end].copy_(causal_prefill(query[start:end], raw[0], raw[1], SCALE))
-        scores = controller.prompt_scores(req_id)[LAYER_IDX]
-        scores.zero_()
-        accumulate_prompt_scores(
-            scores, query[start:end], raw[0], 0, end - start, SCALE
-        )
-        DiffKVImpl._compress_prompt(impl, controller, req_id, LAYER_IDX, raw, scores)
-    return output
-
-
 def cache_bytes(controller):
     return controller.kv_cache.numel() * controller.kv_cache.element_size()
-
-
-def make_diffkv_serving(batch, prompt, kv_heads):
-    lengths = [prompt] * batch
-    query, key, value, starts = qkv_inputs(lengths, kv_heads)
-    controller, request_ids = admit_requests(lengths, kv_heads)
-    output = torch.empty_like(query)
-    bounds = starts.tolist()
-
-    def run(q, k, v):
-        serving_prefill(controller, request_ids, bounds, q, k, v, output)
-
-    run(query, key, value)
-    return Config(
-        run,
-        (query, key, value),
-        output,
-        cache_bytes(controller),
-        {
-            "backend": "DIFFKV",
-            "path": "diffkv.backend (DiffKVImpl.forward prefill branch)",
-            "parts": [
-                "per request: key and value copy into the raw prompt buffer",
-                "per request: FA2 (causal_prefill)",
-                "per request: final-64 query scores (accumulate_prompt_scores)",
-                "per request: compress_and_append_cache_prompt_phase",
-            ],
-        },
-        {},
-    )
 
 
 def make_diffkv(batch, prompt, kv_heads):
@@ -403,7 +345,6 @@ def make_fp8(batch, prompt, kv_heads):
 
 
 CONFIGS = {
-    "diffkv_serving": make_diffkv_serving,
     "diffkv": make_diffkv,
     "fa2_fp16": make_fa2,
     "flashinfer_fp8": make_fp8,
@@ -413,7 +354,7 @@ CONFIGS = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--prompts", type=int, nargs="+", default=[256, 1024])
+    parser.add_argument("--prompts", type=int, nargs="+", default=[256, 512, 1024])
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--repeat-ms", type=int, default=500)
     parser.add_argument(
@@ -496,7 +437,7 @@ def main():
         "operation": "prefill of one layer for whole prompts (chunked prefill "
         "off): attention plus writing the prompt KV into each config's cache",
         "comparison_scope": "one layer for one step; no accuracy check here "
-        "(correctness.py checks diffkv against diffkv_serving)",
+        "(correctness.py checks diffkv against a per-request reference)",
         "configs_timed": list(args.configs),
         "excluded": [
             "cache allocation",

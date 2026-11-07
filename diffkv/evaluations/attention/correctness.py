@@ -593,21 +593,82 @@ def check_prompt_writer(controller, slots, lengths, starts, key, value, scores):
     }
 
 
-def check_prefill(lengths, inputs, kv_heads=8):
-    """prompt_prefill against the backend prefill path on the same inputs.
+SCORE_WINDOW = 64
 
-    Both paths start from freshly admitted requests. Attention output, the
-    group-maximum scores, retained lengths and every retained token of the
-    layer must agree. Both paths share the prompt-phase writer, so its output
-    is also checked against check_prompt_writer's reference.
+
+def reference_prompt_scores(scores, query, key, scale):
+    """Final-64 causal probability sums per query head, as DiffKV defines them.
+
+    Independent of the production path: one explicit matmul and softmax per KV
+    head over the whole prompt, summed over the last SCORE_WINDOW queries.
     """
-    from attention.benchmark_prefill import admit_requests, qkv_inputs, serving_prefill
+    prompt_len, kv_heads = key.shape[0], key.shape[1]
+    first = max(0, prompt_len - SCORE_WINDOW)
+    selected = query[first:]
+    key_positions = torch.arange(prompt_len, device=query.device)
+    query_positions = torch.arange(first, prompt_len, device=query.device)
+    mask = key_positions[None, :] > query_positions[:, None]
+    for head in range(kv_heads):
+        group = slice(head * QUERY_HEADS_PER_KV, (head + 1) * QUERY_HEADS_PER_KV)
+        logits = torch.matmul(
+            selected[:, group].transpose(0, 1).float(),
+            key[:, head].float().transpose(0, 1),
+        )
+        logits.mul_(scale).masked_fill_(mask.unsqueeze(0), float("-inf"))
+        scores[group, :prompt_len].add_(torch.softmax(logits, dim=-1).sum(dim=1))
+
+
+def reference_prefill(controller, request_ids, starts, query, key, value, output):
+    """Prefill one layer per request: FA2, score sums and prompt compression.
+
+    The reference prompt_prefill is compared against. Each request is written,
+    attended, scored and compressed on its own, with its own kernel launches.
+    """
+    from diffkv.backend import KV_BUFFER_SIZE, causal_prefill
+    from diffkv.ops import QUANT_ARGS, get_extension
+
+    extension = get_extension()
+    for row, req_id in enumerate(request_ids):
+        start, end = starts[row], starts[row + 1]
+        raw = controller.raw_prompt(req_id)[LAYER_IDX]
+        raw[0].copy_(key[start:end])
+        raw[1].copy_(value[start:end])
+        output[start:end].copy_(causal_prefill(query[start:end], raw[0], raw[1], SCALE))
+        scores = controller.prompt_scores(req_id)[LAYER_IDX]
+        scores.zero_()
+        reference_prompt_scores(scores, query[start:end], raw[0], SCALE)
+        extension.cache_ops.compress_and_append_cache_prompt_phase(
+            raw[0],
+            raw[1],
+            scores.unsqueeze(0),
+            controller.kv_cache,
+            controller.metadata([req_id]).slot_ids,
+            controller.block_tables,
+            controller.kv_len_tables,
+            torch.tensor([0, end - start], dtype=torch.int32, device=raw.device),
+            controller.compress_config_tables,
+            KV_BUFFER_SIZE,
+            LAYER_IDX,
+            *QUANT_ARGS,
+        )
+    return output
+
+
+def check_prefill(lengths, inputs, kv_heads=8):
+    """prompt_prefill against a per-request reference on the same inputs.
+
+    Both start from freshly admitted requests. Attention output, the
+    group-maximum scores, retained lengths and every retained token of the
+    layer must agree. Both share the prompt-phase writer, so its output is
+    also checked against check_prompt_writer's reference.
+    """
+    from attention.benchmark_prefill import admit_requests, qkv_inputs
     from diffkv.prefill import prompt_prefill
 
     query, key, value, starts = qkv_inputs(lengths, kv_heads, **inputs)
     reference, request_ids = admit_requests(lengths, kv_heads)
     candidate, _ = admit_requests(lengths, kv_heads)
-    expected_output = serving_prefill(
+    expected_output = reference_prefill(
         reference,
         request_ids,
         starts.tolist(),

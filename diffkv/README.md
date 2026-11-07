@@ -35,7 +35,7 @@ diffkv/
     │   └── online/                      비어 있음
     ├── attention/
     │   ├── benchmark_latency.py      decode attention latency 측정
-    │   ├── benchmark_prefill.py      layer 하나의 prefill latency: DiffKV prompt_prefill (python/diffkv/prefill.py), 현재 DiffKV backend 경로, vLLM FA2 FP16, FlashInfer FP8, 모두 cache 쓰기 포함
+    │   ├── benchmark_prefill.py      layer 하나의 prefill latency: DiffKV prompt_prefill (python/diffkv/prefill.py), vLLM FA2 FP16, FlashInfer FP8, 모두 cache 쓰기 포함
     │   ├── correctness.py            attention kernel 정확성 검사 (decode, prompt-phase writer, prompt_prefill)
     │   ├── profile_nsys.py           attention 호출을 nsys로 trace, kernel 시간과 launch 시간 분석
     │   ├── run_latency.sh            clock 고정 decode attention latency 측정 실행
@@ -75,9 +75,9 @@ repo 루트에서 실행합니다.
 | 작업 | 명령 |
 | --- | --- |
 | extension build | `bash diffkv/run_docker.sh python -m diffkv.build_ops` |
-| kernel 정확도 검사 | `bash diffkv/run_docker.sh python diffkv/evaluations/attention/correctness.py` (decode: FP64 기준값 비교, prompt-phase writer: 독립 reference 비교, prefill: prompt_prefill을 chunked prefill 경로와 비교) |
+| kernel 정확도 검사 | `bash diffkv/run_docker.sh python diffkv/evaluations/attention/correctness.py` (decode: FP64 기준값 비교, prompt-phase writer: 독립 reference 비교, prefill: prompt_prefill을 요청별로 따로 계산한 reference와 비교) |
 | decode attention latency | `bash diffkv/evaluations/attention/run_latency.sh [batch ...]` (기본 1 8 32, KV 길이 1024 2048 4096 8192) |
-| prefill latency | `bash diffkv/evaluations/attention/run_prefill.sh [batch ...]` (기본 batch 1 8 32, prompt 256 1024, `DIFFKV_PROMPTS`로 변경, `DIFFKV_PREFILL_PARTS=1`이면 prompt_prefill의 attention, score, 압축도 따로 잼, `DIFFKV_NCU_KERNEL=<regex>`이면 Nsight Compute로 kernel 하나를 `--set full`로 잼: 이때 latency.json은 시간 결과가 아님) |
+| prefill latency | `bash diffkv/evaluations/attention/run_prefill.sh [batch ...]` (기본 batch 1 8 32, prompt 256 512 1024, `DIFFKV_PROMPTS`로 변경, `DIFFKV_PREFILL_PARTS=1`이면 prompt_prefill의 attention, score, 압축도 따로 잼, `DIFFKV_NCU_KERNEL=<regex>`이면 Nsight Compute로 kernel 하나를 `--set full`로 잼: 이때 latency.json은 시간 결과가 아님) |
 | attention profile (Nsight Systems) | `bash diffkv/evaluations/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | MATH-500 correctness | `bash diffkv/evaluations/correctness/run_correctness.sh math500 <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | GPQA-diamond correctness | `bash diffkv/evaluations/correctness/run_correctness.sh gpqa <fp16\|diffkv\|fp8> [최대 출력 token, 기본 16384]` (197문항) |
@@ -97,7 +97,7 @@ repo 루트에서 실행합니다.
 | SM clock | 고정 안 함 | 1395 MHz 고정 | 1395 MHz 고정 |
 | GPU telemetry | 없음 | 200 ms 간격 | 200 ms 간격 |
 
-- 엔진 설정 (모든 backend 같음): eager, chunked prefill off (prompt 전체를 한 step에서 처리, DiffKV는 `prompt_prefill`), async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
+- 엔진 설정 (모든 backend 같음): eager, chunked prefill off (prompt 전체를 한 step에서 처리, DiffKV는 `prompt_prefill`. DiffKV는 조각으로 들어온 prompt를 거부함), async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
 - GPQA-diamond correctness: 197문항(198문항 중 `gpqa-diamond-127` 제외). MATH-500과 같은 `generation/generate.py`(`--max-tokens`)로 실행. 최대 출력 16384 token과 max_model_len 17,408(최대 출력 + prompt 1024 token)만 MATH-500 correctness와 다르고, 나머지 엔진 설정(max_num_batched_tokens 9216 포함)과 생성 조건(EOS까지, greedy)은 같음. 최대 출력 8192 token(2026-11-06)에서는 197문항 중 fp8 130문항, diffkv 132문항이 상한에서 멈춤

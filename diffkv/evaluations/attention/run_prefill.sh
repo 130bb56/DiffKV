@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Prefill latency of one layer for whole prompts (chunked prefill off): current
-# DiffKV backend path, DiffKV prompt_prefill, vLLM FA2 FP16 and FlashInfer FP8,
-# one run per batch size. Prompt lengths come from benchmark_prefill.py
-# defaults (256 1024) unless DIFFKV_PROMPTS is set. DIFFKV_PREFILL_PARTS=1 also
+# Prefill latency of one layer for whole prompts (chunked prefill off): DiffKV
+# prompt_prefill, vLLM FA2 FP16 and FlashInfer FP8, one run per batch size.
+# Prompt lengths come from benchmark_prefill.py defaults (256 512 1024) unless
+# DIFFKV_PROMPTS is set. DIFFKV_PREFILL_PARTS=1 also
 # times prompt_prefill's attention, score and compression launches.
-# DIFFKV_CONFIGS="<name> ..." times only those configs (diffkv_serving, diffkv,
-# fa2_fp16, flashinfer_fp8) and adds their names to the directory. Splitting the
-# configs over GPUs this way compares separate processes on separate devices,
-# not one process on one device.
+# DIFFKV_CONFIGS="<name> ..." times only those configs (diffkv, fa2_fp16,
+# flashinfer_fp8) and adds their names to the directory. Splitting the configs
+# over GPUs this way compares separate processes on separate devices, not one
+# process on one device.
 # Each run goes through utils/lock_clock.sh: SM clock locked to the base clock,
 # cooldown before the run, telemetry, and a rerun when throttled.
 # Usage: run_prefill.sh [batch ...]   (default: 1 8 32)
