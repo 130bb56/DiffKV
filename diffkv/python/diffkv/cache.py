@@ -143,9 +143,33 @@ class DiffKVCacheController:
             + self.free_blocks[: count - first].tolist()
         )
 
+    def _compact_free_ring(self) -> None:
+        """Rewrite the free pages in ascending order starting at index zero.
+
+        allocate_seqs, append_seqs and the free kernels walk free_blocks
+        linearly, so neither a claim from the head nor a release at the tail
+        may run past the end of the ring.
+        """
+        remaining = np.flatnonzero(self._free_mask).astype(np.int32)
+        if len(remaining) != self.free_pages:
+            raise RuntimeError("DiffKV free page bitmap and count disagree")
+        if remaining.size:
+            self.free_blocks[: len(remaining)].copy_(
+                torch.from_numpy(remaining).to(self.device)
+            )
+        self._head = 0
+        self._tail = len(remaining) % self.num_pages
+
+    def _compact_for_release(self) -> None:
+        """Compact when freeing every allocated page would pass the ring end."""
+        if self._tail > self.free_pages:
+            self._compact_free_ring()
+
     def _take_pages(self, count: int) -> tuple[int, int]:
         if count < 0 or count > self.free_pages:
             raise MemoryError(f"DiffKV needs {count} pages; {self.free_pages} are free")
+        if self._head + count > self.num_pages:
+            self._compact_free_ring()
         start = self._head
         if count:
             ids = self._ring_ids(start, count)
@@ -249,6 +273,7 @@ class DiffKVCacheController:
             if self.requests[req_id].phase != "prefill":
                 raise ValueError("DiffKV prompt was already finalized")
         slot_ids = self._slot_ids(request_ids)
+        self._compact_for_release()
         head_count = len(request_ids) * self.num_kv_caches
         counts = torch.empty(head_count * 2, dtype=torch.int32, device=self.device)
         offsets = torch.zeros(head_count + 1, dtype=torch.int32, device=self.device)
@@ -301,6 +326,8 @@ class DiffKVCacheController:
             dtype=torch.int32,
             device=self.device,
         )
+        if self._head + len(request_ids) * self.num_kv_caches * 2 > self.num_pages:
+            self._compact_free_ring()
         offsets[0] = self._head
         self.mem_ops.prepare_append_seqs(
             slot_ids,
@@ -339,6 +366,7 @@ class DiffKVCacheController:
         if state is None:
             return 0
         slot_ids = self._slot_ids([request_id])
+        self._compact_for_release()
         offsets = torch.zeros(
             self.num_kv_caches * 2 + 1, dtype=torch.int32, device=self.device
         )
