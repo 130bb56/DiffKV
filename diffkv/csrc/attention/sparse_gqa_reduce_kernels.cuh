@@ -21,12 +21,6 @@
 // tmp_scores remains partition-normalized scratch; the next main overwrites
 // active entries before use. Only out and retained-token cache scores are
 // final.
-//
-// Chunked prefill runs one row per chunk query over the packed prefix. With
-// chunk_lse (the FA2 log-sum-exp of the same query over its chunk), the output
-// and the cache score increments are normalized over prefix and chunk
-// together, and lse_out receives the combined log-sum-exp. Several rows of one
-// request then add into the same token scores, so the update is atomic.
 
 namespace split_score_reduce_detail {
 
@@ -82,30 +76,7 @@ __device__ __forceinline__ void update_score(uint16_t* kv_cache,
     offset = physical * page_stride + ScoreLayout<60, 4, 2>::kScoreBase +
              (low_token % 60) * 2;
   }
-  atomicAdd(reinterpret_cast<float*>(kv_cache + offset), score);
-}
-
-__device__ __forceinline__ float log_add_exp(float a, float b) {
-  if (isinf(a) && a < 0.f) {
-    return b;
-  }
-  if (isinf(b) && b < 0.f) {
-    return a;
-  }
-  return fmaxf(a, b) + log1pf(expf(-fabsf(a - b)));
-}
-
-// Scale prefix-normalized probabilities to the combined prefix+chunk softmax.
-__device__ __forceinline__ float combine_lse(float prefix_lse,
-                                             const float* chunk_lse,
-                                             int query_index, float& factor) {
-  if (chunk_lse == nullptr) {
-    factor = 1.f;
-    return prefix_lse;
-  }
-  const float full = log_add_exp(prefix_lse, chunk_lse[query_index]);
-  factor = expf(prefix_lse - full);
-  return full;
+  *reinterpret_cast<float*>(kv_cache + offset) += score;
 }
 
 }  // namespace split_score_reduce_detail
@@ -119,8 +90,7 @@ __global__ __launch_bounds__(256) void register_gqa_reduce_kernel(
     uint16_t* __restrict__ kv_cache, const int unified_page_size,
     const int layer_idx, const int num_layers, const int num_kv_heads,
     const int max_context_len, const int max_num_blocks_per_seq,
-    const int max_num_partitions, const float* __restrict__ chunk_lse,
-    float* __restrict__ lse_out) {
+    const int max_num_partitions) {
   static_assert(kPartitionSize > 0);
   constexpr int kReduceThreads = split_score_reduce_detail::kThreads;
   const int sequence = blockIdx.y;
@@ -149,37 +119,14 @@ __global__ __launch_bounds__(256) void register_gqa_reduce_kernel(
   }
 
   if (context_length <= kPartitionSize) {
-    __shared__ float single_factors[4];
-    if (threadIdx.x < 4) {
-      const int query_index = first_query + threadIdx.x;
-      const float prefix_lse = max_logits[query_index * max_num_partitions] +
-                               logf(exp_sums[query_index * max_num_partitions]);
-      float factor;
-      const float full = split_score_reduce_detail::combine_lse(
-          prefix_lse, chunk_lse, query_index, factor);
-      single_factors[threadIdx.x] = factor;
-      if (lse_out != nullptr && tile == 0) {
-        lse_out[query_index] = full;
-      }
-    }
-    __syncthreads();
     if (tile == 0) {
 #pragma unroll
       for (int element = threadIdx.x; element < 4 * 128;
            element += kReduceThreads) {
-        const int query = element / 128;
-        const int query_index = first_query + query;
+        const int query_index = first_query + element / 128;
         const int dimension = element % 128;
-        if (chunk_lse == nullptr) {
-          out[query_index * 128 + dimension] =
-              tmp_out[query_index * max_num_partitions * 128 + dimension];
-        } else {
-          from_float(
-              out[query_index * 128 + dimension],
-              to_float(
-                  tmp_out[query_index * max_num_partitions * 128 + dimension]) *
-                  single_factors[query]);
-        }
+        out[query_index * 128 + dimension] =
+            tmp_out[query_index * max_num_partitions * 128 + dimension];
       }
     }
     for (int token = score_begin + threadIdx.x; token < score_end;
@@ -189,10 +136,10 @@ __global__ __launch_bounds__(256) void register_gqa_reduce_kernel(
       const float p1 = tmp_scores[(first_query + 1) * max_context_len + token];
       const float p2 = tmp_scores[(first_query + 2) * max_context_len + token];
       const float p3 = tmp_scores[(first_query + 3) * max_context_len + token];
-      float score = MAX(0.f, p0 * single_factors[0]);
-      score = MAX(score, p1 * single_factors[1]);
-      score = MAX(score, p2 * single_factors[2]);
-      score = MAX(score, p3 * single_factors[3]);
+      float score = MAX(0.f, p0);
+      score = MAX(score, p1);
+      score = MAX(score, p2);
+      score = MAX(score, p3);
       split_score_reduce_detail::update_score(kv_cache, high_table, low_table,
                                               unified_page_size, high_length,
                                               token, score);
@@ -214,20 +161,21 @@ __global__ __launch_bounds__(256) void register_gqa_reduce_kernel(
     const float* query_sums = exp_sums + query_index * max_num_partitions;
     float* factors = split_score_factors + warp * max_num_partitions;
     float total = 0.f;
-    float maximum = -FLT_MAX;
     if (num_partitions <= 32) {
       // The common P240/C3072 case has 14 partitions. Hold its maximum and
       // sum in registers across the warp reduction instead of loading twice.
       const float local_maximum =
           lane < num_partitions ? query_maxima[lane] : -FLT_MAX;
       const float local_sum = lane < num_partitions ? query_sums[lane] : 0.f;
-      maximum = split_score_reduce_detail::warp_maximum(local_maximum);
+      const float maximum =
+          split_score_reduce_detail::warp_maximum(local_maximum);
       const float factor = expf(local_maximum - maximum);
       total = local_sum * factor;
       if (lane < num_partitions) {
         factors[lane] = (local_sum + 1e-6f) * factor;
       }
     } else {
+      float maximum = -FLT_MAX;
       for (int partition = lane; partition < num_partitions; partition += 32) {
         maximum = fmaxf(maximum, query_maxima[partition]);
       }
@@ -241,13 +189,7 @@ __global__ __launch_bounds__(256) void register_gqa_reduce_kernel(
     }
     total = split_score_reduce_detail::warp_total(total);
     if (lane == 0) {
-      float combine_factor;
-      const float full = split_score_reduce_detail::combine_lse(
-          maximum + logf(total), chunk_lse, query_index, combine_factor);
-      inverse_sums[warp] = combine_factor * __fdividef(1.f, total + 1e-6f);
-      if (lse_out != nullptr && tile == 0) {
-        lse_out[query_index] = full;
-      }
+      inverse_sums[warp] = __fdividef(1.f, total + 1e-6f);
     }
   }
   __syncthreads();

@@ -109,10 +109,8 @@ def get_extension(*, verbose: bool = False) -> ModuleType:
             for name in (
                 "bindings.cpp",
                 "attention/sparse_gqa_attention_kernels.cu",
-                "attention/dequantize_prefix_kernels.cu",
                 "cache_kernels.cu",
                 "long_prompt_cache_kernels.cu",
-                "prompt_score_kernels.cu",
                 "mem_mgt_kernels.cu",
             )
         ],

@@ -49,5 +49,6 @@ class DiffKVSpec(FullAttentionSpec):
 
     def max_memory_usage_bytes(self, vllm_config) -> int:
         length = vllm_config.model_config.max_model_len
+        raw_pages = cdiv(length * self.num_kv_heads * 528, 6784)
         packed_pages = (cdiv(length, 32) + 1) * self.num_kv_heads
-        return packed_pages * 6784
+        return (raw_pages + packed_pages) * 6784
