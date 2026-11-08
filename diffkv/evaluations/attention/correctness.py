@@ -623,20 +623,25 @@ def reference_prefill(controller, request_ids, starts, query, key, value, output
 
     The reference prompt_prefill is compared against. Each request is written,
     attended, scored and compressed on its own, with its own kernel launches.
+    Returns the attention output and each request's FP32 score sums, shaped
+    [kv_heads * queries_per_kv, prompt_tokens].
     """
     from diffkv.backend import KV_BUFFER_SIZE, causal_prefill
     from diffkv.ops import QUANT_ARGS, get_extension
 
     extension = get_extension()
+    sums = {}
     for row, req_id in enumerate(request_ids):
         start, end = starts[row], starts[row + 1]
-        raw = controller.raw_prompt(req_id)[LAYER_IDX]
-        raw[0].copy_(key[start:end])
-        raw[1].copy_(value[start:end])
+        raw = torch.stack((key[start:end], value[start:end])).contiguous()
         output[start:end].copy_(causal_prefill(query[start:end], raw[0], raw[1], SCALE))
-        scores = controller.prompt_scores(req_id)[LAYER_IDX]
-        scores.zero_()
+        scores = torch.zeros(
+            (raw.shape[2] * QUERY_HEADS_PER_KV, end - start),
+            dtype=torch.float32,
+            device=raw.device,
+        )
         reference_prompt_scores(scores, query[start:end], raw[0], SCALE)
+        sums[req_id] = scores
         extension.cache_ops.compress_and_append_cache_prompt_phase(
             raw[0],
             raw[1],
@@ -651,7 +656,7 @@ def reference_prefill(controller, request_ids, starts, query, key, value, output
             LAYER_IDX,
             *QUANT_ARGS,
         )
-    return output
+    return output, sums
 
 
 def check_prefill(lengths, inputs, kv_heads=8):
@@ -668,7 +673,7 @@ def check_prefill(lengths, inputs, kv_heads=8):
     query, key, value, starts = qkv_inputs(lengths, kv_heads, **inputs)
     reference, request_ids = admit_requests(lengths, kv_heads)
     candidate, _ = admit_requests(lengths, kv_heads)
-    expected_output = reference_prefill(
+    expected_output, expected_sums = reference_prefill(
         reference,
         request_ids,
         starts.tolist(),
@@ -696,7 +701,7 @@ def check_prefill(lengths, inputs, kv_heads=8):
     torch.testing.assert_close(output, expected_output, atol=1e-3, rtol=1e-3)
     maximum_score_error = 0.0
     for row, (req_id, length) in enumerate(zip(request_ids, lengths)):
-        sums = reference.prompt_scores(req_id)[LAYER_IDX]
+        sums = expected_sums[req_id]
         group_max = sums.view(kv_heads, QUERY_HEADS_PER_KV, length).amax(dim=1)
         torch.testing.assert_close(
             scores[row, :, :length], group_max, atol=1e-6, rtol=1e-3

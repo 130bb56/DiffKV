@@ -26,6 +26,7 @@ diffkv/
     │   ├── README.md                 측정 방법과 결과표
     │   ├── run_correctness.sh        benchmark 이름을 받아 EOS 실행으로 생성 후 채점
     │   ├── score_outputs.py          outputs.json 채점 (MATH-500 수식 비교, GPQA 답 글자 비교), grades.json 저장
+    │   ├── compare_runs.py           채점 끝난 실행 여러 개를 문항별로 비교 (출력 token 일치, 잘린 문항, 정상 종료 문항만의 정답률)
     │   └── test_gpqa.py              GPQA 채점, 197문항 workload, 생성 설정 테스트
     ├── serving/
     │   ├── offline/
@@ -79,12 +80,13 @@ repo 루트에서 실행합니다.
 | decode attention latency | `bash diffkv/evaluations/attention/run_latency.sh [batch ...]` (기본 1 8 32, KV 길이 1024 2048 4096 8192) |
 | prefill latency | `bash diffkv/evaluations/attention/run_prefill.sh [batch ...]` (기본 batch 1 8 32, prompt 256 512 1024, `DIFFKV_PROMPTS`로 변경, `DIFFKV_PREFILL_PARTS=1`이면 prompt_prefill의 attention, score, 압축도 따로 잼, `DIFFKV_NCU_KERNEL=<regex>`이면 Nsight Compute로 kernel 하나를 `--set full`로 잼: 이때 latency.json은 시간 결과가 아님) |
 | attention profile (Nsight Systems) | `bash diffkv/evaluations/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
-| MATH-500 correctness | `bash diffkv/evaluations/correctness/run_correctness.sh math500 <fp16\|diffkv\|fp8> <sample50\|all500>` |
+| MATH-500 correctness | `bash diffkv/evaluations/correctness/run_correctness.sh math500 <fp16\|diffkv\|fp8> <sample50\|all500> [최대 출력 token, 기본 8192]` (8192가 아니면 결과 디렉터리 이름에 `-osl<값>`을 붙임. `max_num_batched_tokens`가 9216이라 8192보다 큰 상한은 chunked prefill을 켜야 함. `DIFFKV_CHUNKED_PREFILL=1`이면 prompt를 여러 step에 나눠 넣고 결과 디렉터리 이름에 `-chunked`를 붙임. DiffKV는 조각으로 들어온 prompt를 거부하므로 fp16과 fp8 전용) |
 | GPQA-diamond correctness | `bash diffkv/evaluations/correctness/run_correctness.sh gpqa <fp16\|diffkv\|fp8> [최대 출력 token, 기본 16384]` (197문항) |
 | offline serving | `bash diffkv/evaluations/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |
 | offline serving step 분해 (Nsight Systems) | `DIFFKV_NSYS_STEPS="<첫 step> <step 수>" bash diffkv/evaluations/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>`: 측정 구간의 engine step(0부터 셈) 중 지정한 구간만 trace하고 그 뒤 실행을 멈춤. 결과 디렉터리 이름에 `-nsys-s<첫 step>-n<step 수>`, `trace.nsys-rep`, `trace.sqlite`, `step_breakdown.json`(`profile.py nsys`: step별 wall 시간, GPU busy와 idle 시간, kernel 종류별 시간, 동기화 API 호출 수) 추가 |
 | offline serving kernel 분석 (Nsight Compute) | `DIFFKV_NCU_STEPS="<첫 step> <step 수>" bash diffkv/evaluations/serving/offline/run_offline_serving.sh <diffkv\|fp8>`: 지정한 연속 engine step마다 decoder layer 0의 attention module이 실행하는 attention, reduce, KV cache 쓰기 kernel(`register_gqa_attention_kernel`, `register_gqa_reduce_kernel`, `compress_and_append_cache_decode_phase`, FlashInfer attention, `reshape_and_cache`)만 `--set full`로 재고 실행을 멈춤. `generate.py --profile-first-layer`가 layer 0 attention module 앞뒤에서 `cudaProfilerStart`와 `cudaProfilerStop`을 호출하고 ncu는 `--profile-from-start off`로 그 사이만 잼. 결과 디렉터리 이름에 `-ncu-s<첫 step>-n<step 수>`, `kernels.ncu-rep`, `kernels_raw.csv`, `kernel_summary.json`(`profile.py ncu`: kernel별로 모든 step의 평균: 시간, DRAM 사용률, occupancy, register, stall 이유, pipe 사용률) 추가 |
 | 두 실행 비교 | `bash diffkv/run_docker.sh python diffkv/evaluations/generation/postprocess.py --reference <기준 outputs.json> --candidate <비교 outputs.json> --reference-backend <backend> --candidate-backend <backend>` |
+| 채점 결과 비교 | `bash diffkv/run_docker.sh python diffkv/evaluations/correctness/compare_runs.py <실행 디렉터리> <실행 디렉터리> ...`: 실행마다 정답 수, 잘린 문항 수, 잘리지 않은 문항만의 정답률을 내고, 쌍마다 출력 token이 같은 문항 수, 처음 달라지는 token 위치, 정답과 오답이 뒤집힌 문항 수를 냄. `postprocess.py`는 backend만 다른 두 실행을 요구하지만(commit, GPU, engine 설정이 다르면 거부) 이쪽은 commit이나 설정이 다른 실행도 비교함 |
 | harness test | `bash diffkv/run_docker.sh python diffkv/evaluations/generation/test_generation.py` |
 | GPQA harness test | `bash diffkv/run_docker.sh python diffkv/evaluations/correctness/test_gpqa.py` |
 
