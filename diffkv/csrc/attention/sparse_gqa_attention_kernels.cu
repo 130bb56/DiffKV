@@ -173,11 +173,13 @@ void sparse_paged_attention_gqa(
               "GQA reuse attention output, workspace and cache tensors must be "
               "contiguous");
   TORCH_CHECK(
-      reinterpret_cast<uintptr_t>(kv_cache.data_ptr()) % alignof(k_vec_type) ==
+      reinterpret_cast<uintptr_t>(kv_cache.data_ptr()) % alignof(uint4) == 0 &&
+          (kv_cache.size(1) * sizeof(uint16_t)) % alignof(uint4) == 0 &&
+          reinterpret_cast<uintptr_t>(query.data_ptr()) % alignof(uint4) ==
               0 &&
-          (kv_cache.size(1) * sizeof(uint16_t)) % alignof(k_vec_type) == 0,
-      "GQA reuse attention requires an 8-byte aligned cache base and page "
-      "stride");
+          query.stride(0) % 8 == 0,
+      "GQA reuse attention requires 16-byte aligned cache pages and query "
+      "rows");
   TORCH_CHECK(query.size(0) > 0 && max_context_len > 0,
               "GQA reuse attention requires a nonempty batch and positive "
               "max_context_len");

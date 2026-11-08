@@ -16,33 +16,75 @@
 
 // Include inside diffkv::gqa_reuse, after the common constants are declared.
 // kPartitionSize must also match sparse_paged_attention_gqa_reduce.
-// Stage probabilities while reusing decoded K/V directly in registers.
+// QK and PV run as FP16 m16n8k16 tensor core MMAs on the exact integer codes.
+// Each token's scale and zero point are applied outside the MMA:
+//   logit  = scale_k * (q . code_k) + zero_k * sum(q)
+//   output = sum(p * scale_v * code_v) + sum(p * zero_v)
 
 namespace register_gqa_detail {
 
-constexpr int kDimensionThreads = 8;
-constexpr int kDimensionsPerThread = 128 / kDimensionThreads;
-constexpr int kGroupsPerWarp = 32 / kDimensionThreads;
 constexpr int kWarps = kThreads / 32;
-constexpr int kValueGroups = kWarps * kGroupsPerWarp;
+constexpr int kTileTokens = 16;
+// A partition holds at most 240 tokens. Split over its high and low regions
+// it spans at most 16 tiles.
+constexpr int kMaxTiles = 16;
+constexpr int kTilesPerWarp = kMaxTiles / kWarps;
+constexpr int kSlots = kMaxTiles * kTileTokens;
+constexpr int kSlotsPerThread = kSlots / kThreads;
+// The padding puts the four query rows in different banks.
+constexpr int kRowStride = kSlots + 8;
+constexpr int kMaxHighPages = 10;
+constexpr int kMaxLowPages = 6;
+// FP16 1024 in both halves. OR-ing a code below 1024 into the mantissa gives
+// exactly 1024 + code.
+constexpr uint32_t kMagic = 0x64006400;
 
-union SharedWorkspace {
-  float probabilities[4][kPartitionSize];
-  float output_partials[kValueGroups][128];
+static_assert(kPartitionSize <= 240 && kSlotsPerThread * kThreads == kSlots);
+
+template <int PageTokens, int KeyBits, int ValueBits>
+struct PageLayout {
+  static constexpr int kTokens = PageTokens;
+  static constexpr int kKeyMeta =
+      DIVIDE_ROUND_UP(PageTokens * 128 * KeyBits / 16 * 2, 32) * 16;
+  static constexpr int kValue =
+      DIVIDE_ROUND_UP(kKeyMeta * 2 + PageTokens * 4, 128) * 64;
+  static constexpr int kValueMeta =
+      kValue + DIVIDE_ROUND_UP(PageTokens * 128 * ValueBits / 16 * 2, 32) * 16;
+  // Distance between two value payload rows (dimension slices).
+  static constexpr int kValueRow = PageTokens * 8;
+};
+using HighPage = PageLayout<32, 8, 4>;
+using LowPage = PageLayout<60, 4, 2>;
+static_assert(HighPage::kKeyMeta == 2048 && HighPage::kValue == 2112 &&
+              HighPage::kValueMeta == 3136);
+static_assert(LowPage::kKeyMeta == 1920 && LowPage::kValue == 2048 &&
+              LowPage::kValueMeta == 3008);
+
+// Tokens [begin, end) of one region. Tiles start at the even token
+// tile_begin, so every 32-bit value load holds one stored token pair.
+struct Region {
+  int begin;
+  int end;
+  int tile_begin;
+  int first_tile;
+  int tiles;
+  int first_page;
+  int logical_offset;
 };
 
-// Both dimension-sliced stores and contiguous final-output reads use all
-// 32 banks. The XOR transform is bijective within each 128-element row.
-__device__ __forceinline__ int output_column(int group, int dimension) {
-  return dimension ^ (dimension >> 4) ^ ((group & 3) << 3);
-}
-
-__device__ __forceinline__ float maximum(float value) {
-#pragma unroll
-  for (int delta = 16; delta; delta /= 2) {
-    value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, delta));
-  }
-  return value;
+__device__ __forceinline__ Region make_region(int begin, int end,
+                                              int first_tile, int page_tokens,
+                                              int logical_offset) {
+  Region region;
+  region.begin = begin;
+  region.end = end;
+  region.tile_begin = begin & ~1;
+  region.first_tile = first_tile;
+  region.tiles =
+      end > begin ? DIVIDE_ROUND_UP(end - region.tile_begin, kTileTokens) : 0;
+  region.first_page = region.tile_begin / page_tokens;
+  region.logical_offset = logical_offset;
+  return region;
 }
 
 __device__ __forceinline__ float sum(float value) {
@@ -53,192 +95,304 @@ __device__ __forceinline__ float sum(float value) {
   return value;
 }
 
-template <int PageTokens, int KeyBits>
-__device__ __forceinline__ void compute_keys(
-    const uint16_t* kv_cache, const int* block_table, bool reverse_pages,
-    int page_stride, int region_begin, int region_end, int logical_offset,
-    int first_partition_token, int context_length, float scale,
-    const float* alibi_slopes, int first_head,
-    const float (&query_values)[4][kDimensionsPerThread],
-    SharedWorkspace& workspace, float (&local_maxima)[4]) {
-  constexpr int kPack = 16 / KeyBits;
-  constexpr int kPacks = 128 / kPack;
-  constexpr int kMetaBase = DIVIDE_ROUND_UP(PageTokens * kPacks * 2, 32) * 16;
-  constexpr int kVectors = kDimensionsPerThread / (kPack * K_VEC_SIZE);
+__device__ __forceinline__ void mma(float (&d)[4], uint32_t a0, uint32_t a1,
+                                    uint32_t a2, uint32_t a3, uint32_t b0,
+                                    uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t hsub2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("sub.f16x2 %0, %1, %2;\n" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+
+__device__ __forceinline__ uint32_t hfma2(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t d;
+  asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+
+// Two FP16 codes from the code bits under mask, one from each 16-bit half.
+// Shift is the bit position of the code within its half.
+template <int Shift>
+__device__ __forceinline__ uint32_t codes(uint32_t bits, uint32_t mask) {
+  const uint32_t magic = (bits & mask) | kMagic;
+  if constexpr (Shift == 0) {
+    return hsub2(magic, kMagic);
+  } else if constexpr (Shift == 2) {
+    return hfma2(magic, 0x34003400, 0xDC00DC00);  // x / 4 - 256
+  } else if constexpr (Shift == 4) {
+    return hfma2(magic, 0x2C002C00, 0xD400D400);  // x / 16 - 64
+  } else {
+    static_assert(Shift == 6);
+    return hfma2(magic, 0x24002400, 0xCC00CC00);  // x / 64 - 16
+  }
+}
+
+// Two FP16 codes from the 8-bit codes in bytes Selector picks.
+template <uint32_t Selector>
+__device__ __forceinline__ uint32_t byte_codes(uint32_t bits) {
+  return hsub2(__byte_perm(bits, 0x64646464, Selector), kMagic);
+}
+
+__device__ __forceinline__ float half_sum(uint32_t bits) {
+  return to_float(static_cast<uint16_t>(bits)) +
+         to_float(static_cast<uint16_t>(bits >> 16));
+}
+
+// B fragments of the KV head's four queries (MMA column g, zero for g >= 4)
+// in the dimension order of one key layout, and sum(q) for the C columns
+// 2t and 2t + 1 this lane holds.
+struct QueryFragments {
+  uint32_t b[8][2];
+  float sums[2];
+};
+
+__device__ __forceinline__ void finish_query_sums(float sum, int lane,
+                                                  QueryFragments& query) {
+  sum += __shfl_xor_sync(0xffffffff, sum, 1);
+  sum += __shfl_xor_sync(0xffffffff, sum, 2);
+  const int t = lane % 4;
+  query.sums[0] = __shfl_sync(0xffffffff, sum, (2 * t) * 4);
+  query.sums[1] = __shfl_sync(0xffffffff, sum, (2 * t + 1) * 4);
+}
+
+// Lane t holds dimensions 32a + 8t + [0, 8) for a in [0, 4). Step s takes
+// the pairs 32(s / 2) + 8t + 4(s % 2) + {0, 2}, as the K8 words do.
+__device__ __forceinline__ void load_high_queries(const uint16_t* queries,
+                                                  QueryFragments& query) {
+  const int lane = threadIdx.x % 32;
+  const int g = lane / 4;
+  const int t = lane % 4;
+  float total = 0.f;
+#pragma unroll
+  for (int a = 0; a < 4; ++a) {
+    uint4 x = make_uint4(0, 0, 0, 0);
+    if (g < 4) {
+      x = *reinterpret_cast<const uint4*>(queries + g * 128 + 32 * a + 8 * t);
+    }
+    query.b[2 * a][0] = x.x;
+    query.b[2 * a][1] = x.y;
+    query.b[2 * a + 1][0] = x.z;
+    query.b[2 * a + 1][1] = x.w;
+    total += half_sum(x.x) + half_sum(x.y) + half_sum(x.z) + half_sum(x.w);
+  }
+  finish_query_sums(total, lane, query);
+}
+
+// Lane t holds dimensions 32a + 16(t / 2) + [0, 16) for a = 2(t % 2) + {0, 1}.
+// A K4 word pairs dimension d with d + 4, so the queries are paired the same
+// way.
+__device__ __forceinline__ void load_low_queries(const uint16_t* queries,
+                                                 QueryFragments& query) {
+  const int lane = threadIdx.x % 32;
+  const int g = lane / 4;
+  const int t = lane % 4;
+  float total = 0.f;
+#pragma unroll
+  for (int chunk = 0; chunk < 2; ++chunk) {
+    uint4 lo = make_uint4(0, 0, 0, 0);
+    uint4 hi = lo;
+    if (g < 4) {
+      const uint4* source = reinterpret_cast<const uint4*>(
+          queries + g * 128 + 32 * (2 * (t % 2) + chunk) + 16 * (t / 2));
+      lo = source[0];
+      hi = source[1];
+    }
+    const uint32_t y[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int i = 2 * chunk + half;
+      const int k = 4 * half;
+      query.b[2 * i][0] = __byte_perm(y[k], y[k + 2], 0x5410);
+      query.b[2 * i][1] = __byte_perm(y[k], y[k + 2], 0x7632);
+      query.b[2 * i + 1][0] = __byte_perm(y[k + 1], y[k + 3], 0x5410);
+      query.b[2 * i + 1][1] = __byte_perm(y[k + 1], y[k + 3], 0x7632);
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      total += half_sum(y[k]);
+    }
+  }
+  finish_query_sums(total, lane, query);
+}
+
+// Each warp takes every fourth tile of the partition. MMA row g and g + 8 of
+// a tile are its tokens g and g + 8; column 2t + e is query 2t + e.
+template <bool kHigh>
+__device__ __forceinline__ void compute_logits(
+    const uint16_t* kv_cache, const int* pages, int page_stride,
+    const Region& region, const QueryFragments& query, float scale,
+    const float* alibi_slopes, int first_head, int context_length,
+    float (*logits)[kRowStride], float (&maxima)[2]) {
+  using Page = std::conditional_t<kHigh, HighPage, LowPage>;
+  constexpr int kWords = kHigh ? 8 : 4;
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
-  // Four token groups, each with eight strided dimension threads.
-  const int token_group = lane % kGroupsPerWarp;
-  const int dimension_thread = lane / kGroupsPerWarp;
-  const int original_key_group = dimension_thread / 2;
-  const int first_vector = (dimension_thread % 2) * kVectors;
+  const int g = lane / 4;
+  const int t = lane % 4;
+  const int first = (warp - region.first_tile) & (kWarps - 1);
 
-  for (int page = region_begin / PageTokens + warp;
-       page < DIVIDE_ROUND_UP(region_end, PageTokens); page += kWarps) {
-    const int64_t physical =
-        reverse_pages ? block_table[-page] : block_table[page];
-    const int64_t page_base = physical * page_stride;
-    for (int token = token_group; token < PageTokens; token += kGroupsPerWarp) {
-      const int region_token = page * PageTokens + token;
-      const bool valid =
-          region_token >= region_begin && region_token < region_end;
-      float products[4] = {0.f, 0.f, 0.f, 0.f};
-      if (valid) {
-        const quant_meta_type meta = *reinterpret_cast<const quant_meta_type*>(
-            kv_cache + page_base + kMetaBase + token * 2);
-        const float scale_key = to_float(meta.scale);
-        const float zero_key = to_float(meta.zero_point);
+  uint32_t keys[kTilesPerWarp][2][kWords];
+  uint32_t metas[kTilesPerWarp][2];
 #pragma unroll
-        for (int vector = 0; vector < kVectors; ++vector) {
-          const int offset = (((first_vector + vector) * PageTokens + token) *
-                                  THREAD_GROUP_SIZE_K +
-                              original_key_group) *
-                             K_VEC_SIZE;
-          const k_vec_type packed = *reinterpret_cast<const k_vec_type*>(
-              kv_cache + page_base + offset);
+  for (int i = 0; i < kTilesPerWarp; ++i) {
+    const int tile = first + i * kWarps;
 #pragma unroll
-          for (int packed_element = 0; packed_element < K_VEC_SIZE;
-               ++packed_element) {
-            float decoded[kPack];
-            unpack_and_dequant(packed.data[packed_element], KeyBits, scale_key,
-                               zero_key, decoded);
+    for (int row = 0; row < 2; ++row) {
+      const int token = region.tile_begin + tile * kTileTokens + row * 8 + g;
 #pragma unroll
-            for (int element = 0; element < kPack; ++element) {
-              const int dimension =
-                  (vector * K_VEC_SIZE + packed_element) * kPack + element;
+      for (int word = 0; word < kWords; ++word) {
+        keys[i][row][word] = 0;
+      }
+      metas[i][row] = 0;
+      if (tile < region.tiles && token >= region.begin &&
+          token < region.end) {
+        const uint16_t* page =
+            kv_cache +
+            int64_t(pages[token / Page::kTokens - region.first_page]) *
+                page_stride;
+        const int slot = token % Page::kTokens;
+        // K8: lane t reads dimension slice t, 32 bytes. K4: lane t reads half
+        // of slice t / 2, 16 bytes.
+        const uint4* key = reinterpret_cast<const uint4*>(
+            page + (kHigh ? (t * 32 + slot) * 16
+                          : ((t / 2) * 60 + slot) * 16 + (t % 2) * 8));
 #pragma unroll
-              for (int query = 0; query < 4; ++query) {
-                products[query] = fmaf(query_values[query][dimension],
-                                       decoded[element], products[query]);
-              }
-            }
+        for (int vector = 0; vector < kWords / 4; ++vector) {
+          const uint4 data = key[vector];
+          keys[i][row][4 * vector] = data.x;
+          keys[i][row][4 * vector + 1] = data.y;
+          keys[i][row][4 * vector + 2] = data.z;
+          keys[i][row][4 * vector + 3] = data.w;
+        }
+        metas[i][row] = *reinterpret_cast<const uint32_t*>(
+            page + Page::kKeyMeta + slot * 2);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < kTilesPerWarp; ++i) {
+    const int tile = first + i * kWarps;
+    if (tile >= region.tiles) {
+      continue;
+    }
+    float products[4] = {0.f, 0.f, 0.f, 0.f};
+    if constexpr (kHigh) {
+#pragma unroll
+      for (int step = 0; step < 8; ++step) {
+        mma(products, byte_codes<0x4140>(keys[i][0][step]),
+            byte_codes<0x4140>(keys[i][1][step]),
+            byte_codes<0x4342>(keys[i][0][step]),
+            byte_codes<0x4342>(keys[i][1][step]), query.b[step][0],
+            query.b[step][1]);
+      }
+    } else {
+#pragma unroll
+      for (int word = 0; word < 4; ++word) {
+        uint32_t nibbles[2][4];
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+          const uint32_t bits = keys[i][row][word];
+          nibbles[row][0] = codes<0>(bits, 0x000F000F);
+          nibbles[row][1] = codes<4>(bits, 0x00F000F0);
+          nibbles[row][2] = codes<0>(bits >> 8, 0x000F000F);
+          nibbles[row][3] = codes<4>(bits >> 8, 0x00F000F0);
+        }
+        mma(products, nibbles[0][0], nibbles[1][0], nibbles[0][1],
+            nibbles[1][1], query.b[2 * word][0], query.b[2 * word][1]);
+        mma(products, nibbles[0][2], nibbles[1][2], nibbles[0][3],
+            nibbles[1][3], query.b[2 * word + 1][0],
+            query.b[2 * word + 1][1]);
+      }
+    }
+    if (t < 2) {
+#pragma unroll
+      for (int row = 0; row < 2; ++row) {
+        const int token = region.tile_begin + tile * kTileTokens + row * 8 + g;
+        const bool valid = token >= region.begin && token < region.end;
+        const float key_scale = to_float(static_cast<uint16_t>(metas[i][row]));
+        const float key_zero =
+            to_float(static_cast<uint16_t>(metas[i][row] >> 16));
+        const int slot =
+            (region.first_tile + tile) * kTileTokens + row * 8 + g;
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float logit = (key_scale * products[2 * row + e] +
+                         key_zero * query.sums[e]) *
+                        scale;
+          if (alibi_slopes != nullptr) {
+            logit += alibi_slopes[first_head + 2 * t + e] *
+                     (region.logical_offset + token - context_length + 1);
           }
-        }
-      }
-// Every lane participates, including groups beyond a partial page.
-#pragma unroll
-      for (int delta = kGroupsPerWarp; delta < 32; delta *= 2) {
-        float shuffled[4];
-#pragma unroll
-        for (int query = 0; query < 4; ++query) {
-          shuffled[query] =
-              __shfl_down_sync(0xffffffff, products[query], delta);
-        }
-#pragma unroll
-        for (int query = 0; query < 4; ++query) {
-          products[query] += shuffled[query];
-        }
-      }
-#pragma unroll
-      for (int query = 0; query < 4; ++query) {
-        if (dimension_thread == 0 && valid) {
-          const int logical_token = logical_offset + region_token;
-          const float slope =
-              alibi_slopes == nullptr ? 0.f : alibi_slopes[first_head + query];
-          const float logit =
-              products[query] * scale +
-              (slope != 0.f ? slope * (logical_token - context_length + 1)
-                            : 0.f);
-          workspace
-              .probabilities[query][logical_token - first_partition_token] =
-              logit;
-          local_maxima[query] = fmaxf(local_maxima[query], logit);
+          logits[2 * t + e][slot] = valid ? logit : -INFINITY;
+          if (valid) {
+            maxima[e] = fmaxf(maxima[e], logit);
+          }
         }
       }
     }
   }
 }
 
-template <int PageTokens, int KeyBits, int ValueBits>
-__device__ __forceinline__ void compute_values(
-    const uint16_t* kv_cache, const int* block_table, bool reverse_pages,
-    int page_stride, int region_begin, int region_end, int logical_offset,
-    int first_partition_token, const SharedWorkspace& workspace,
-    quant_meta_type (&value_metadata)[kWarps][60],
-    float (&accumulators)[4][kDimensionsPerThread]) {
-  constexpr int kKeyPacks = 128 * KeyBits / 16;
-  constexpr int kValuePack = 16 / ValueBits;
-  constexpr int kValuePacks = 128 / kValuePack;
-  constexpr int kPaddedTokens =
-      DIVIDE_ROUND_UP(PageTokens, V_VEC_SIZE) * V_VEC_SIZE;
-  constexpr int kKeyMetaBase =
-      DIVIDE_ROUND_UP(PageTokens * kKeyPacks * 2, 32) * 16;
-  constexpr int kValueBase =
-      DIVIDE_ROUND_UP(kKeyMetaBase * 2 + PageTokens * 4, 128) * 64;
-  constexpr int kValueMetaBase =
-      kValueBase + DIVIDE_ROUND_UP(kPaddedTokens * kValuePacks * 2, 32) * 16;
-  constexpr int kPacksPerThread = kDimensionsPerThread / kValuePack;
+// Value words for the MMA A fragments of every tile: rows g and g + 8 are
+// value dimensions of slice g, k = 2t, 2t + 1 and 2t + 8, 2t + 9 are the tile
+// tokens. Warp w covers dimensions 16g + 4w + [0, 4).
+__device__ __forceinline__ void load_values(
+    const uint16_t* kv_cache, const int* high_pages, const int* low_pages,
+    int page_stride, const Region& high, const Region& low,
+    uint32_t (&values)[kMaxTiles][2]) {
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
-  const int token_group = lane / kDimensionThreads;
-  const int dimension_thread = lane % kDimensionThreads;
-
-  for (int page = region_begin / PageTokens + warp;
-       page < DIVIDE_ROUND_UP(region_end, PageTokens); page += kWarps) {
-    const int64_t physical =
-        reverse_pages ? block_table[-page] : block_table[page];
-    const int64_t page_base = physical * page_stride;
-    // Each warp owns its metadata row. No block-wide tile barrier is needed.
-    for (int token = lane; token < PageTokens; token += 32) {
-      value_metadata[warp][token] = *reinterpret_cast<const quant_meta_type*>(
-          kv_cache + page_base + kValueMetaBase + token * 2);
+  const int g = lane / 4;
+  const int t = lane % 4;
+  const int tiles = high.tiles + low.tiles;
+#pragma unroll
+  for (int tile = 0; tile < kMaxTiles; ++tile) {
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+      values[tile][pair] = 0;
     }
-    __syncwarp();
-    for (int vector = token_group;
-         vector < DIVIDE_ROUND_UP(PageTokens, V_VEC_SIZE);
-         vector += kGroupsPerWarp) {
-      const int first_token = vector * V_VEC_SIZE;
-      // Keep each token pair's payload packed: four 32-bit words for V4,
-      // two for V2. Each physical payload word is still fetched once.
-      v_vec_type packed_values[kPacksPerThread];
+    if (tile >= tiles) {
+      continue;
+    }
+    const bool is_high = tile < high.tiles;
 #pragma unroll
-      for (int pack = 0; pack < kPacksPerThread; ++pack) {
-        const int offset =
-            pack * kPaddedTokens * kDimensionThreads +
-            (vector * kDimensionThreads + dimension_thread) * V_VEC_SIZE;
-        packed_values[pack] = *reinterpret_cast<const v_vec_type*>(
-            kv_cache + page_base + kValueBase + offset);
-      }
-#pragma unroll
-      for (int element = 0; element < V_VEC_SIZE; ++element) {
-        const int token = first_token + element;
-        const int region_token = page * PageTokens + token;
-        if (token < PageTokens && region_token >= region_begin &&
-            region_token < region_end) {
-          // These values depend on the token, not on its output pack. Load and
-          // convert them once before visiting the four/two packed dim slices.
-          const quant_meta_type meta = value_metadata[warp][token];
-          const float value_scale = to_float(meta.scale);
-          const float value_zero = to_float(meta.zero_point);
-          const int weight_offset =
-              logical_offset + region_token - first_partition_token;
-          float weights[4];
-#pragma unroll
-          for (int query = 0; query < 4; ++query) {
-            weights[query] = workspace.probabilities[query][weight_offset];
-          }
-#pragma unroll
-          for (int pack = 0; pack < kPacksPerThread; ++pack) {
-            float decoded[kValuePack];
-            unpack_and_dequant(packed_values[pack].data[element], ValueBits,
-                               value_scale, value_zero, decoded);
-#pragma unroll
-            for (int query = 0; query < 4; ++query) {
-              const float weight = weights[query];
-#pragma unroll
-              for (int dimension = 0; dimension < kValuePack; ++dimension) {
-                const int output_dimension = pack * kValuePack + dimension;
-                accumulators[query][output_dimension] =
-                    fmaf(weight, decoded[dimension],
-                         accumulators[query][output_dimension]);
-              }
-            }
-          }
+    for (int pair = 0; pair < 2; ++pair) {
+      if (is_high) {
+        const int token = high.tile_begin + tile * kTileTokens + 8 * pair +
+                          2 * t;
+        if (token < high.end) {
+          const int slot = token % HighPage::kTokens;
+          const uint16_t* page =
+              kv_cache +
+              int64_t(high_pages[token / HighPage::kTokens - high.first_page]) *
+                  page_stride;
+          values[tile][pair] = *reinterpret_cast<const uint32_t*>(
+              page + HighPage::kValue + warp * HighPage::kValueRow +
+              slot / 2 * 16 + 2 * g);
+        }
+      } else {
+        const int token = low.tile_begin +
+                          (tile - low.first_tile) * kTileTokens + 8 * pair +
+                          2 * t;
+        if (token < low.end) {
+          const int slot = token % LowPage::kTokens;
+          const uint16_t* page =
+              kv_cache +
+              int64_t(low_pages[token / LowPage::kTokens - low.first_page]) *
+                  page_stride;
+          values[tile][pair] = *reinterpret_cast<const uint32_t*>(
+              page + LowPage::kValue + (warp / 2) * LowPage::kValueRow +
+              slot / 2 * 16 + 2 * g);
         }
       }
     }
-    // Keep a faster subgroup from overwriting metadata for a slower subgroup.
-    __syncwarp();
   }
 }
 
@@ -254,7 +408,7 @@ __global__ __launch_bounds__(128, 4) void register_gqa_attention_kernel(
     const float* alibi_slopes) {
   using namespace register_gqa_detail;
   static_assert(kThreads == 128 && kHeadSize == 128 && kQueriesPerKv == 4);
-  static_assert(kPartitionSize > 0);
+  static_assert(sizeof(scalar_t) == sizeof(uint16_t));
   const int sequence = blockIdx.y;
   const int kv_head = blockIdx.x;
   const int partition = blockIdx.z;
@@ -286,141 +440,239 @@ __global__ __launch_bounds__(128, 4) void register_gqa_attention_kernel(
   } else if (partition != 0) {
     return;
   }
-  const int first_token =
-      high_end > high_begin ? high_begin : high_length + low_begin;
-  const int token_count = high_end - high_begin + low_end - low_begin;
+  const Region high =
+      make_region(high_begin, high_end, 0, HighPage::kTokens, 0);
+  const Region low = make_region(low_begin, low_end, high.tiles,
+                                 LowPage::kTokens, high_length);
+  const int tiles = high.tiles + low.tiles;
   const int* block_table = block_tables + table_offset * max_blocks;
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
-  __shared__ SharedWorkspace workspace;
+  const int g = lane / 4;
+  const int t = lane % 4;
+  __shared__ float logits[4][kRowStride];
+  __shared__ uint16_t weights[4][kRowStride];
+  __shared__ int high_pages[kMaxHighPages];
+  __shared__ int low_pages[kMaxLowPages];
   __shared__ float warp_maxima[4][kWarps];
   __shared__ float warp_sums[4][kWarps];
-  __shared__ quant_meta_type value_metadata[kWarps][60];
+  __shared__ float warp_zeros[4][kWarps];
 
-  // End this scope before the four-query PV accumulator becomes live.
+  if (threadIdx.x < kMaxHighPages) {
+    const int page = high.first_page + threadIdx.x;
+    if (high.tiles > 0 && page <= (high.end - 1) / HighPage::kTokens) {
+      high_pages[threadIdx.x] = block_table[page];
+    }
+  } else if (threadIdx.x >= 32 && threadIdx.x < 32 + kMaxLowPages) {
+    const int page = low.first_page + threadIdx.x - 32;
+    if (low.tiles > 0 && page <= (low.end - 1) / LowPage::kTokens) {
+      low_pages[threadIdx.x - 32] = block_table[max_blocks - 1 - page];
+    }
+  }
+  __syncthreads();
+
+  // Each thread later normalizes the slots threadIdx.x + k * kThreads. Fetch
+  // their value metadata now, behind the key work.
+  int logical_tokens[kSlotsPerThread];
+  bool valid_slots[kSlotsPerThread];
+  uint32_t value_metas[kSlotsPerThread];
+#pragma unroll
+  for (int k = 0; k < kSlotsPerThread; ++k) {
+    const int slot = threadIdx.x + k * kThreads;
+    const bool is_high = slot < low.first_tile * kTileTokens;
+    const int token = is_high
+                          ? high.tile_begin + slot
+                          : low.tile_begin + slot - low.first_tile * kTileTokens;
+    valid_slots[k] =
+        slot < tiles * kTileTokens &&
+        (is_high ? token >= high.begin && token < high.end
+                 : token >= low.begin && token < low.end);
+    logical_tokens[k] = is_high ? token : high_length + token;
+    value_metas[k] = 0;
+    if (valid_slots[k]) {
+      const uint16_t* page =
+          kv_cache +
+          int64_t(is_high
+                      ? high_pages[token / HighPage::kTokens - high.first_page]
+                      : low_pages[token / LowPage::kTokens - low.first_page]) *
+              unified_page_size;
+      value_metas[k] = *reinterpret_cast<const uint32_t*>(
+          page + (is_high ? HighPage::kValueMeta +
+                                token % HighPage::kTokens * 2
+                          : LowPage::kValueMeta +
+                                token % LowPage::kTokens * 2));
+    }
+  }
+
+  float maxima[2] = {-FLT_MAX, -FLT_MAX};
   {
-    float local_maxima[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
-    {
-      const int dimension_thread = lane / kGroupsPerWarp;
-      float query_values[4][kDimensionsPerThread];
-#pragma unroll
-      for (int query = 0; query < 4; ++query) {
-        const scalar_t* source = queries + sequence * query_stride +
-                                 (first_head + query) * 128 +
-                                 dimension_thread * kDimensionsPerThread;
-#pragma unroll
-        for (int dimension = 0; dimension < kDimensionsPerThread; ++dimension) {
-          query_values[query][dimension] = to_float(source[dimension]);
-        }
-      }
-      compute_keys<32, 8>(kv_cache, block_table, false, unified_page_size,
-                          high_begin, high_end, 0, first_token, context_length,
-                          scale, alibi_slopes, first_head, query_values,
-                          workspace, local_maxima);
-      compute_keys<60, 4>(kv_cache, block_table + max_blocks - 1, true,
-                          unified_page_size, low_begin, low_end, high_length,
-                          first_token, context_length, scale, alibi_slopes,
-                          first_head, query_values, workspace, local_maxima);
+    const uint16_t* query = reinterpret_cast<const uint16_t*>(queries) +
+                            int64_t(sequence) * query_stride + first_head * 128;
+    if (high.tiles > 0) {
+      QueryFragments fragments;
+      load_high_queries(query, fragments);
+      compute_logits<true>(kv_cache, high_pages, unified_page_size, high,
+                           fragments, scale, alibi_slopes, first_head,
+                           context_length, logits, maxima);
     }
-// Publish all four query maxima together. This also waits for every K
-// logit write, replacing the separate barrier before the softmax loop.
-#pragma unroll
-    for (int query = 0; query < 4; ++query) {
-      const float warp_max = maximum(local_maxima[query]);
-      if (lane == 0) {
-        warp_maxima[query][warp] = warp_max;
-      }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int query = 0; query < 4; ++query) {
-      const float maximum_logit =
-          maximum(lane < kWarps ? warp_maxima[query][lane] : -FLT_MAX);
-      float local_sum = 0.f;
-      for (int token = threadIdx.x; token < token_count; token += kThreads) {
-        const float value =
-            __expf(workspace.probabilities[query][token] - maximum_logit);
-        workspace.probabilities[query][token] = value;
-        local_sum += value;
-      }
-      local_sum = sum(local_sum);
-      if (lane == 0) {
-        warp_sums[query][warp] = local_sum;
-      }
-      if (threadIdx.x == 0) {
-        const int index =
-            (sequence * num_heads + first_head + query) * partition_stride +
-            partition;
-        max_logits[index] = maximum_logit;
-      }
-    }
-    // Each query has a separate row, so all sums can share this barrier.
-    __syncthreads();
-#pragma unroll
-    for (int query = 0; query < 4; ++query) {
-      const float exponential_sum =
-          sum(lane < kWarps ? warp_sums[query][lane] : 0.f);
-      const float inverse_sum = __fdividef(1.f, exponential_sum + 1e-6f);
-      for (int token = threadIdx.x; token < token_count; token += kThreads) {
-        const float probability =
-            workspace.probabilities[query][token] * inverse_sum;
-        workspace.probabilities[query][token] = probability;
-        tmp_scores[(sequence * num_heads + first_head + query) *
-                       max_context_len +
-                   first_token + token] = probability;
-      }
-      if (threadIdx.x == 0) {
-        const int index =
-            (sequence * num_heads + first_head + query) * partition_stride +
-            partition;
-        exp_sums[index] = exponential_sum;
-      }
+    if (low.tiles > 0) {
+      QueryFragments fragments;
+      load_low_queries(query, fragments);
+      compute_logits<false>(kv_cache, low_pages, unified_page_size, low,
+                            fragments, scale, alibi_slopes, first_head,
+                            context_length, logits, maxima);
     }
   }
-  __syncthreads();
-  float accumulators[4][kDimensionsPerThread];
-#pragma unroll
-  for (int query = 0; query < 4; ++query) {
-#pragma unroll
-    for (int dimension = 0; dimension < kDimensionsPerThread; ++dimension) {
-      accumulators[query][dimension] = 0.f;
-    }
-  }
-  compute_values<32, 8, 4>(kv_cache, block_table, false, unified_page_size,
-                           high_begin, high_end, 0, first_token, workspace,
-                           value_metadata, accumulators);
-  compute_values<60, 4, 2>(kv_cache, block_table + max_blocks - 1, true,
-                           unified_page_size, low_begin, low_end, high_length,
-                           first_token, workspace, value_metadata,
-                           accumulators);
+  // Issued before the softmax so its latency overlaps the barriers.
+  uint32_t values[kMaxTiles][2];
+  load_values(kv_cache, high_pages, low_pages, unified_page_size, high, low,
+              values);
 
-  // Probabilities are dead only once every warp has completed PV.
+#pragma unroll
+  for (int e = 0; e < 2; ++e) {
+#pragma unroll
+    for (int delta = 4; delta < 32; delta *= 2) {
+      maxima[e] = fmaxf(maxima[e], __shfl_xor_sync(0xffffffff, maxima[e], delta));
+    }
+  }
+  if (lane < 2) {
+    warp_maxima[2 * lane][warp] = maxima[0];
+    warp_maxima[2 * lane + 1][warp] = maxima[1];
+  }
   __syncthreads();
-  const int value_group = warp * kGroupsPerWarp + lane / kDimensionThreads;
-  const int dimension_thread = lane % kDimensionThreads;
+
+  float maximum_logits[4];
+  float sums[4] = {0.f, 0.f, 0.f, 0.f};
+  float zeros[4] = {0.f, 0.f, 0.f, 0.f};
+  float exponentials[kSlotsPerThread][4];
 #pragma unroll
-  for (int query = 0; query < 4; ++query) {
+  for (int q = 0; q < 4; ++q) {
+    maximum_logits[q] = warp_maxima[q][0];
 #pragma unroll
-    for (int dimension = 0; dimension < kDimensionsPerThread; ++dimension) {
-      workspace.output_partials[value_group][output_column(
-          value_group, dimension_thread * kDimensionsPerThread + dimension)] =
-          accumulators[query][dimension];
+    for (int w = 1; w < kWarps; ++w) {
+      maximum_logits[q] = fmaxf(maximum_logits[q], warp_maxima[q][w]);
     }
-    __syncthreads();
-    if (threadIdx.x < 128) {
-      float value = 0.f;
+  }
 #pragma unroll
-      for (int group = 0; group < kValueGroups; ++group) {
-        value +=
-            workspace.output_partials[group][output_column(group, threadIdx.x)];
+  for (int k = 0; k < kSlotsPerThread; ++k) {
+    const int slot = threadIdx.x + k * kThreads;
+    const float value_scale = to_float(static_cast<uint16_t>(value_metas[k]));
+    const float value_zero =
+        to_float(static_cast<uint16_t>(value_metas[k] >> 16));
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float exponential =
+          valid_slots[k] ? __expf(logits[q][slot] - maximum_logits[q]) : 0.f;
+      exponentials[k][q] = exponential;
+      sums[q] += exponential;
+      zeros[q] += valid_slots[k] ? exponential * value_zero : 0.f;
+      if (slot < tiles * kTileTokens) {
+        from_float(weights[q][slot],
+                   valid_slots[k] ? exponential * value_scale : 0.f);
       }
-      const int index =
-          ((sequence * num_heads + first_head + query) * partition_stride +
-           partition) *
-              128 +
-          threadIdx.x;
-      from_float(tmp_out[index], value);
     }
-    __syncthreads();
+  }
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    sums[q] = sum(sums[q]);
+    zeros[q] = sum(zeros[q]);
+    if (lane == 0) {
+      warp_sums[q][warp] = sums[q];
+      warp_zeros[q][warp] = zeros[q];
+    }
+  }
+  __syncthreads();
+
+  float inverse_sums[4];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    float exponential_sum = 0.f;
+    zeros[q] = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      exponential_sum += warp_sums[q][w];
+      zeros[q] += warp_zeros[q][w];
+    }
+    inverse_sums[q] = __fdividef(1.f, exponential_sum + 1e-6f);
+    if (threadIdx.x == 0) {
+      const int index =
+          (sequence * num_heads + first_head + q) * partition_stride +
+          partition;
+      max_logits[index] = maximum_logits[q];
+      exp_sums[index] = exponential_sum;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kSlotsPerThread; ++k) {
+    if (valid_slots[k]) {
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        tmp_scores[(sequence * num_heads + first_head + q) * max_context_len +
+                   logical_tokens[k]] = exponentials[k][q] * inverse_sums[q];
+      }
+    }
+  }
+
+  float outputs[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+  for (int tile = 0; tile < kMaxTiles; ++tile) {
+    if (tile >= tiles) {
+      continue;
+    }
+    uint32_t b0 = 0, b1 = 0;
+    if (g < 4) {
+      b0 = *reinterpret_cast<const uint32_t*>(
+          &weights[g][tile * kTileTokens + 2 * t]);
+      b1 = *reinterpret_cast<const uint32_t*>(
+          &weights[g][tile * kTileTokens + 8 + 2 * t]);
+    }
+    uint32_t a[2][4];
+    if (tile < high.tiles) {
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const uint32_t bits = values[tile][pair];
+        a[pair][0] = codes<0>(bits, 0x000F000F);
+        a[pair][1] = codes<4>(bits, 0x00F000F0);
+        a[pair][2] = codes<0>(bits >> 8, 0x000F000F);
+        a[pair][3] = codes<4>(bits >> 8, 0x00F000F0);
+      }
+    } else {
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const uint32_t bits = warp % 2 ? values[tile][pair] >> 8
+                                       : values[tile][pair];
+        a[pair][0] = codes<0>(bits, 0x00030003);
+        a[pair][1] = codes<2>(bits, 0x000C000C);
+        a[pair][2] = codes<4>(bits, 0x00300030);
+        a[pair][3] = codes<6>(bits, 0x00C000C0);
+      }
+    }
+    mma(outputs[0], a[0][0], a[0][1], a[1][0], a[1][1], b0, b1);
+    mma(outputs[1], a[0][2], a[0][3], a[1][2], a[1][3], b0, b1);
+  }
+
+  // Lane (g, t < 2) holds dimensions 16g + 4w + 2m + {0, 1} of queries 2t and
+  // 2t + 1.
+  if (t < 2) {
+#pragma unroll
+    for (int m = 0; m < 2; ++m) {
+      const int dimension = 16 * g + 4 * warp + 2 * m;
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int q = 2 * t + e;
+        const float zero = t == 0 ? zeros[e] : zeros[2 + e];
+        const float inverse = t == 0 ? inverse_sums[e] : inverse_sums[2 + e];
+        uint16_t first, second;
+        from_float(first, (outputs[m][e] + zero) * inverse);
+        from_float(second, (outputs[m][2 + e] + zero) * inverse);
+        const int index =
+            ((sequence * num_heads + first_head + q) * partition_stride +
+             partition) *
+                128 +
+            dimension;
+        *reinterpret_cast<uint32_t*>(tmp_out + index) =
+            uint32_t(first) | (uint32_t(second) << 16);
+      }
+    }
   }
 }
