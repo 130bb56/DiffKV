@@ -11,8 +11,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from math500.correctness.score_outputs import grade_one
-from math500.generation_utils import (
+from correctness.score_outputs import grade_math500
+from generation.generation_utils import (
+    OUTPUT_LENGTHS,
+    PROBLEMS,
     OutputRecorder,
     backend_options,
     load_workload,
@@ -20,16 +22,16 @@ from math500.generation_utils import (
     request_signature,
     summarize,
 )
-from math500.serving.offline.compare_offline_serving import compare
+from generation.postprocess import compare
 
 HERE = Path(__file__).parent
 
 
 class HarnessTest(unittest.TestCase):
     def setUp(self):
-        self.workload_path = HERE / "problems/math500_sample50.json"
+        self.workload_path = PROBLEMS[50]
         self.workload = load_workload(self.workload_path, 50)
-        self.lengths_path = HERE / "serving/offline/output_lengths_sample50.json"
+        self.lengths_path = OUTPUT_LENGTHS
 
     def test_fixed_output_lengths_total_185093_tokens(self):
         limits = output_limits(
@@ -229,11 +231,12 @@ class HarnessTest(unittest.TestCase):
                 compare(workload, result("fp16"), wrong, "fp16", "fp8")
 
     def test_grading_uses_final_answer_and_never_last_number_fallback(self):
-        self.assertTrue(grade_one(r"<think>\boxed{2}</think>\boxed{3}", "3")["correct"])
-        self.assertFalse(grade_one("I considered 3 possibilities", "3")["correct"])
+        final = r"<think>\boxed{2}</think>\boxed{3}"
+        self.assertTrue(grade_math500(final, "3")["correct"])
+        self.assertFalse(grade_math500("I considered 3 possibilities", "3")["correct"])
 
     def test_sync_corrections_remain_explicit(self):
-        result = grade_one(r"\boxed{1}, \boxed{2}", "1, 2")
+        result = grade_math500(r"\boxed{1}, \boxed{2}", "1, 2")
         self.assertFalse(result["raw_correct"])
         self.assertTrue(result["correct"])
         self.assertEqual(result["correction"], "multiple_boxed_set")

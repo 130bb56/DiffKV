@@ -273,7 +273,9 @@ def main():
         help="FP8 arms to add; pass no value to compare only DiffKV and FA2",
     )
     parser.add_argument(
-        "--output", type=Path, help="default: diffkv/logs/latency-b*-<UTC>.json"
+        "--output",
+        type=Path,
+        help="default: logs/attention/<UTC>-latency-b<batch>/latency.json",
     )
     args = parser.parse_args()
     if args.output is None:

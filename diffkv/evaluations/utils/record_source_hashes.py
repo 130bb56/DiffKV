@@ -9,7 +9,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from math500.generation_utils import save_json, sha256
+from generation.generation_utils import save_json, sha256
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_DIRS = ("diffkv",)

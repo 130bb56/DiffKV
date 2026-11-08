@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-only input validation and measurements for the MATH-500 runs."""
+"""CPU-only input validation and measurements for the MATH-500 and GPQA runs."""
 
 import hashlib
 import json
@@ -9,14 +9,16 @@ import statistics
 from datetime import UTC, datetime
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LOG_DIR = HERE / "logs"
+EVALUATIONS = Path(__file__).resolve().parents[1]
+LOG_DIR = EVALUATIONS / "logs"
 PROBLEMS = {
-    50: HERE / "problems/math500_sample50.json",
-    500: HERE / "problems/math500_all.json",
+    50: EVALUATIONS / "benchmarks/math500/math500_sample50.json",
+    500: EVALUATIONS / "benchmarks/math500/math500_all.json",
 }
 PROBLEM_SET_NAMES = {50: "sample50", 500: "all500"}
-OUTPUT_LENGTHS = HERE / "serving/offline/output_lengths_sample50.json"
+GPQA_DIAMOND = EVALUATIONS / "benchmarks/gpqa/gpqa_diamond.json"
+GPQA_DIAMOND_197 = EVALUATIONS / "benchmarks/gpqa/gpqa_diamond_197.json"
+OUTPUT_LENGTHS = EVALUATIONS / "serving/offline/osl.json"
 BACKEND_OPTIONS = {
     "fp16": {},
     "diffkv": {"attention_backend": "DIFFKV"},
@@ -71,7 +73,7 @@ def save_json(path, value):
 def load_workload(path, expected_count):
     workload = read_json(path)
     rows = workload["requests"]
-    if expected_count not in (50, 500) or len(rows) != expected_count:
+    if len(rows) != expected_count:
         raise ValueError(f"Expected {expected_count} requests, found {len(rows)}")
     seen = set()
     for row in rows:

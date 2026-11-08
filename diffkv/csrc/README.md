@@ -54,13 +54,13 @@ decode append and complete-request release need twice that head count plus one.
 All kernels run on PyTorch's current stream, guarded to the input device.
 
 Kernel validation and a controlled FP16 and FP8 comparison live in
-`diffkv/benchmarks/attention/correctness.py` and
-`diffkv/benchmarks/attention/benchmark_latency.py`. Results go to
-`diffkv/benchmarks/attention/logs/` unless `--output` is given:
+`diffkv/evaluations/attention/correctness.py` and
+`diffkv/evaluations/attention/benchmark_latency.py`. Results go to
+`diffkv/evaluations/logs/attention/` unless `--output` is given:
 
 ```sh
-bash diffkv/run_docker.sh python diffkv/benchmarks/attention/correctness.py
-bash diffkv/benchmarks/attention/run_latency.sh
+bash diffkv/run_docker.sh python diffkv/evaluations/attention/correctness.py
+bash diffkv/evaluations/attention/run_latency.sh
 ```
 
 The FP64 oracle checks outputs, repeated importance increments, and unchanged

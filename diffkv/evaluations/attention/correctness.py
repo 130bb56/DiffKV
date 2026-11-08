@@ -23,11 +23,11 @@ SCALE = HEAD_SIZE**-0.5
 QUANT_ARGS = (8, 4, 4, 2, 1, 1, 1, 1, 4, 2, 32, 60)
 PARTITION_SIZE = 240
 GQA_PARTITION_SIZE = 240
-LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs/attention"
 
 
 def default_run_dir(name):
-    """Return a new timestamped run directory under attention/logs."""
+    """Return a new timestamped run directory under logs/attention."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return LOG_DIR / f"{stamp}-{name}"
 
@@ -446,7 +446,9 @@ def run_checks(extension):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--output", type=Path, help="default: logs/<UTC>-correctness/correctness.json"
+        "--output",
+        type=Path,
+        help="default: logs/attention/<UTC>-correctness/correctness.json",
     )
     args = parser.parse_args()
     if args.output is None:

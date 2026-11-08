@@ -6,7 +6,7 @@ import argparse
 import math
 from pathlib import Path
 
-from math500.generation_utils import (
+from generation.generation_utils import (
     BACKEND_OPTIONS,
     PROBLEMS,
     backend_options,
@@ -134,10 +134,11 @@ def compare(
         "different token counts; length replay compares identical output counts.",
     }
     if fm["mode"] == "natural":
-        from math500.correctness import score_outputs
-        from math500.correctness.score_outputs import grade_run
+        from correctness import score_outputs
+        from correctness.score_outputs import grade_run
 
-        fgrade, dgrade = grade_run(workload, reference), grade_run(workload, candidate)
+        fgrade = grade_run(workload, reference, "math500")
+        dgrade = grade_run(workload, candidate, "math500")
         result["correctness"] = {reference_backend: fgrade, candidate_backend: dgrade}
         result["accuracy_difference_percentage_points"] = (
             100 * (dgrade["accuracy"] - fgrade["accuracy"])
@@ -159,7 +160,9 @@ def compare(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--workload", type=Path, help="default: problems/ file for --expected-count"
+        "--workload",
+        type=Path,
+        help="default: benchmarks/math500/ file for --expected-count",
     )
     parser.add_argument("--expected-count", type=int, choices=(50, 500), default=50)
     parser.add_argument(

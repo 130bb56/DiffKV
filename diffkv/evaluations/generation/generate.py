@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generate answers to MATH-500 problems through vLLM 0.32's LLMEngine (offline).
+"""Generate answers to a frozen workload through vLLM 0.32's LLMEngine (offline).
+
+The workload is a MATH-500 file of benchmarks/ by default; --workload selects
+another (GPQA-diamond). Engine and generation settings do not depend on the
+workload.
 
 All requests arrive at once; one backend per process. Tokenization, model
 loading, warmup and grading are outside the measured interval. Importing this
@@ -15,7 +19,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from math500.generation_utils import (
+from generation.generation_utils import (
     BACKEND_OPTIONS,
     PROBLEM_SET_NAMES,
     PROBLEMS,
@@ -33,9 +37,11 @@ from math500.generation_utils import (
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
+# Prompt tokens allowed on top of --max-tokens (max_model_len 9216 for 8192).
+PROMPT_TOKENS = 1024
 
 
-def engine_options(model):
+def engine_options(model, max_tokens):
     return {
         "model": str(model.resolve()),
         "tokenizer": str(model.resolve()),
@@ -43,7 +49,7 @@ def engine_options(model):
         "load_format": "safetensors",
         "tensor_parallel_size": 1,
         "seed": 42,
-        "max_model_len": 9216,
+        "max_model_len": max_tokens + PROMPT_TOKENS,
         "max_num_batched_tokens": 9216,
         "max_num_seqs": 64,
         "gpu_memory_utilization": 0.9,
@@ -166,9 +172,22 @@ def parse_args():
     parser.add_argument("--backend", choices=tuple(BACKEND_OPTIONS), required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
-        "--workload", type=Path, help="default: problems/ file for --expected-count"
+        "--workload",
+        type=Path,
+        help="default: benchmarks/math500/ file for --expected-count",
     )
-    parser.add_argument("--expected-count", type=int, choices=(50, 500), default=50)
+    parser.add_argument(
+        "--expected-count",
+        type=int,
+        default=50,
+        help="request count; 50 and 500 have default workload files and run names",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help=f"output token limit; max_model_len adds {PROMPT_TOKENS} prompt tokens",
+    )
     parser.add_argument("--mode", choices=("natural", "length_replay"), required=True)
     parser.add_argument("--lengths-from", type=Path)
     parser.add_argument(
@@ -199,6 +218,8 @@ def parse_args():
         parser.error("--profile-steps needs FIRST >= 0 and COUNT >= 1")
     if args.profile_first_layer and not args.profile_steps:
         parser.error("--profile-first-layer needs --profile-steps")
+    if args.expected_count not in PROBLEMS and None in (args.workload, args.output):
+        parser.error("other request counts need --workload and --output")
     if args.workload is None:
         args.workload = PROBLEMS[args.expected_count]
     if args.output is None:
@@ -211,10 +232,13 @@ def parse_args():
 def main():
     args = parse_args()
     workload = load_workload(args.workload, args.expected_count)
-    limits = output_limits(workload, args.workload, args.mode, args.lengths_from)
+    limits = output_limits(
+        workload, args.workload, args.mode, args.lengths_from, args.max_tokens
+    )
     requests = workload["requests"]
     if args.warmup_tokens < 0:
         raise ValueError("Warmup length must be nonnegative")
+    max_model_len = args.max_tokens + PROMPT_TOKENS
     for row in requests:
         if (
             len(row["prompt_token_ids"])
@@ -222,10 +246,12 @@ def main():
                 limits[row["request_id"]],
                 args.warmup_tokens,
             )
-            > 9216
+            > max_model_len
         ):
-            raise ValueError(f"Input plus output exceeds 9216: {row['request_id']}")
-    options = engine_options(args.model)
+            raise ValueError(
+                f"Input plus output exceeds {max_model_len}: {row['request_id']}"
+            )
+    options = engine_options(args.model, args.max_tokens)
     options.update(backend_options(args.backend))
     metadata = {
         "backend": args.backend,
@@ -239,7 +265,7 @@ def main():
             "temperature": 0.0,
             "top_p": 1.0,
             "seed": 42,
-            "max_tokens": 8192,
+            "max_tokens": args.max_tokens,
             "ignore_eos": args.mode == "length_replay",
         },
         "warmup_tokens": args.warmup_tokens,
