@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DiffKV attention with chunked prefill and the native GQA decode kernels."""
+"""DiffKV attention: whole-prompt prefill, chunked prefill and GQA decode kernels."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from diffkv.cache import DiffKVCacheController
 from diffkv.ops import PARTITION_SIZE, QUANT_ARGS, get_extension
+from diffkv.prefill import prompt_prefill
 from vllm.config import get_current_vllm_config
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -23,9 +24,20 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 
-SCORE_WINDOW = 64
 KV_BUFFER_SIZE = 64
-SHORT_PROMPT_LIMIT = 4000
+
+
+@dataclass(frozen=True)
+class _PromptBatch:
+    """Requests whose whole prompt is in this step; prompt_prefill handles
+    them together in every layer."""
+
+    request_ids: list[str]
+    token_range: tuple[int, int] | None
+    rows: torch.Tensor | None
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+    slot_ids: torch.Tensor
 
 
 @dataclass
@@ -44,6 +56,7 @@ class _BatchState:
     decode_workspace: tuple[torch.Tensor, ...] | None = None
     compressed_layers: dict[str, set[int]] = field(default_factory=dict)
     executed_layers: set[int] = field(default_factory=set)
+    prompts: _PromptBatch | None = None
 
 
 _controller: DiffKVCacheController | None = None
@@ -94,7 +107,9 @@ def set_batch_state(
     controller = _controller
     if controller is None:
         raise RuntimeError("DiffKV worker cache was not initialized")
-    decode_ids, decode_rows, row = [], [], 0
+    decode_ids, decode_rows = [], []
+    prompt_ids, prompt_rows, prompt_lengths = [], [], []
+    row = 0
     for req_id in req_ids:
         request = controller.requests[req_id]
         start, count = computed[req_id], scheduled[req_id]
@@ -105,16 +120,24 @@ def set_batch_state(
         if start + count > controller.max_model_len:
             raise ValueError("DiffKV scheduled tokens exceed the context limit")
         if request.phase == "prefill":
-            if start + count > request.prompt_len:
+            if start != 0 or count != request.prompt_len:
                 raise ValueError(
-                    "A DiffKV prefill chunk cannot cross the prompt boundary"
+                    "DiffKV prefills a whole prompt in one step; "
+                    "run with chunked prefill off"
                 )
+            prompt_ids.append(req_id)
+            prompt_rows.extend(range(row, row + count))
+            prompt_lengths.append(count)
         else:
             if count != 1:
                 raise ValueError("DiffKV currently supports one decode token per step")
             decode_ids.append(req_id)
             decode_rows.append(row)
         row += count
+    if prompt_ids:
+        state.prompts = _prompt_batch(
+            controller, prompt_ids, prompt_rows, prompt_lengths
+        )
     if decode_ids:
         slots = controller.metadata(decode_ids).slot_ids
         # Retained lengths bound the attention partitions; never positions.
@@ -127,6 +150,22 @@ def set_batch_state(
         if decode_rows != list(range(len(decode_rows))):
             state.decode_rows = controller.device_tensor(decode_rows, torch.long)
     _batch_state = state
+
+
+def _prompt_batch(controller, request_ids, rows, lengths) -> _PromptBatch:
+    device = controller.device
+    contiguous = rows[-1] - rows[0] + 1 == len(rows)
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return _PromptBatch(
+        request_ids,
+        (rows[0], rows[-1] + 1) if contiguous else None,
+        None if contiguous else torch.tensor(rows, dtype=torch.long, device=device),
+        torch.tensor(offsets, dtype=torch.int32, device=device),
+        max(lengths),
+        controller.metadata(request_ids).slot_ids,
+    )
 
 
 def finish_batch() -> Callable[[], dict[str, Any]] | None:
@@ -299,43 +338,6 @@ def causal_prefill(
     return result.squeeze(0).transpose(0, 1)
 
 
-def accumulate_prompt_scores(
-    scores: torch.Tensor,
-    query: torch.Tensor,
-    key_prefix: torch.Tensor,
-    query_start: int,
-    prompt_len: int,
-    scale: float,
-) -> None:
-    """Accumulate final-64 causal probability sums separately for every Q head.
-
-    The maximum over the four heads in a GQA group must happen only after all
-    chunks have contributed. Doing a maximum per chunk changes DiffKV's policy.
-    """
-    first = max(query_start, prompt_len - SCORE_WINDOW)
-    query_end = query_start + query.shape[0]
-    if first >= query_end:
-        return
-    selected = query[first - query_start :]
-    num_kv_heads = key_prefix.shape[1]
-    if query.shape[1] != num_kv_heads * 4:
-        raise ValueError("DiffKV scoring requires four query heads per KV head")
-    key_positions = torch.arange(key_prefix.shape[0], device=query.device)
-    query_positions = torch.arange(first, query_end, device=query.device)
-    mask = key_positions[None, :] > query_positions[:, None]
-    # Bound FP32 scratch to one KV head, independently of the layer/head count.
-    for head in range(num_kv_heads):
-        q = selected[:, head * 4 : (head + 1) * 4].transpose(0, 1).float()
-        k = key_prefix[:, head].float().transpose(0, 1)
-        logits = torch.matmul(q, k) * scale
-        logits.masked_fill_(mask.unsqueeze(0), float("-inf"))
-        probabilities = torch.softmax(logits, dim=-1)
-        scores[head * 4 : (head + 1) * 4, : key_prefix.shape[0]].add_(
-            probabilities.sum(dim=1)
-        )
-        del logits, probabilities, q, k
-
-
 class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
     def __init__(
         self,
@@ -427,33 +429,10 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
         if layer_index in state.executed_layers:
             raise RuntimeError("DiffKV attention layer executed twice in one batch")
         num_decodes = len(state.decode_ids)
-        has_prefill = num_decodes < len(state.request_ids)
-        for row, req_id in enumerate(state.request_ids if has_prefill else ()):
-            request = controller.requests[req_id]
-            if request.phase == "decode":
-                continue
-            start, end = attn_metadata.query_offsets[row : row + 2]
-            prefix_start = state.computed[req_id]
-            prefix_end = prefix_start + state.scheduled[req_id]
-            raw = controller.raw_prompt(req_id)[layer_index]
-            raw[0, prefix_start:prefix_end].copy_(k[start:end])
-            raw[1, prefix_start:prefix_end].copy_(v[start:end])
-            out[start:end].copy_(
-                causal_prefill(
-                    q[start:end], raw[0, :prefix_end], raw[1, :prefix_end], self.scale
-                )
-            )
-            scores = controller.prompt_scores(req_id)[layer_index]
-            accumulate_prompt_scores(
-                scores,
-                q[start:end],
-                raw[0, :prefix_end],
-                prefix_start,
-                request.prompt_len,
-                self.scale,
-            )
-            if prefix_end == request.prompt_len:
-                self._compress_prompt(controller, req_id, layer_index, raw, scores)
+        prompts = state.prompts
+        if prompts is not None:
+            self._prefill_prompts(controller, prompts, layer_index, q, k, v, out)
+            for req_id in prompts.request_ids:
                 state.compressed_layers.setdefault(req_id, set()).add(layer_index)
         if num_decodes:
             rows = state.decode_rows
@@ -487,39 +466,40 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
         state.executed_layers.add(layer_index)
         return output
 
-    def _compress_prompt(self, controller, req_id, layer_index, raw, scores) -> None:
-        extension = get_extension()
-        request = controller.requests[req_id]
-        slots = controller.metadata([req_id]).slot_ids
-        offsets = torch.tensor(
-            [0, request.prompt_len], dtype=torch.int32, device=raw.device
-        )
-        common = (
+    def _prefill_prompts(self, controller, prompts, layer_index, q, k, v, out) -> None:
+        """Attention, scores and compression of whole prompts in one launch each."""
+        caches = (
             controller.kv_cache,
-            slots,
+            prompts.slot_ids,
             controller.block_tables,
             controller.kv_len_tables,
-            offsets,
             controller.compress_config_tables,
-            KV_BUFFER_SIZE,
             layer_index,
-            *QUANT_ARGS,
         )
-        if request.prompt_len <= SHORT_PROMPT_LIMIT:
-            extension.cache_ops.compress_and_append_cache_prompt_phase(
-                raw[0], raw[1], scores.unsqueeze(0), *common
+        if prompts.token_range is not None:
+            start, end = prompts.token_range
+            prompt_prefill(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                prompts.cu_seqlens,
+                prompts.max_seqlen,
+                self.scale,
+                *caches,
+                out=out[start:end],
             )
-        else:
-            maximum = scores.view(self.num_kv_heads, 4, request.prompt_len).amax(dim=1)
-            queries_per_key = torch.arange(
-                request.prompt_len, 0, -1, dtype=torch.float32, device=raw.device
-            ).clamp_max_(SCORE_WINDOW)
-            mean_scores = maximum / queries_per_key
-            mean_scores[:, -KV_BUFFER_SIZE:] = 1.0
-            sorted_indices = mean_scores.argsort(dim=-1).to(torch.int32).unsqueeze(0)
-            extension.cache_ops.compress_and_append_cache_long_prompt_phase(
-                raw[0], raw[1], maximum.unsqueeze(0), sorted_indices, *common
-            )
+            return
+        rows = prompts.rows
+        output, _ = prompt_prefill(
+            q[rows],
+            k[rows],
+            v[rows],
+            prompts.cu_seqlens,
+            prompts.max_seqlen,
+            self.scale,
+            *caches,
+        )
+        out.index_copy_(0, rows, output)
 
     def _decode(self, controller, state, layer_index, query, key, value, output):
         extension = get_extension()

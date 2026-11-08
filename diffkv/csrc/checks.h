@@ -20,8 +20,22 @@ inline void check_cache(const torch::Tensor& key, const torch::Tensor& value,
                         const torch::Tensor& tables,
                         const torch::Tensor& lengths,
                         const torch::Tensor& config, int layer) {
-  check_tensor(key, key, at::kHalf, "key");
-  check_tensor(value, key, at::kHalf, "value");
+  // Writers address tokens through key.stride(0), so K/V may be token rows of
+  // a wider tensor (e.g. views of the QKV projection) as long as each row is
+  // [KV heads, 128] contiguous and both share the token stride.
+  for (const auto& [tensor, name] :
+       {std::pair{&key, "key"}, std::pair{&value, "value"}}) {
+    TORCH_CHECK(tensor->is_cuda() && tensor->device() == key.device(), name,
+                " must be on the same CUDA device as the input");
+    TORCH_CHECK(tensor->scalar_type() == at::kHalf, name,
+                " has an unsupported dtype");
+    TORCH_CHECK(tensor->dim() == 3 && tensor->stride(2) == 1 &&
+                    tensor->stride(1) == tensor->size(2) &&
+                    tensor->stride(0) >= tensor->size(1) * tensor->size(2),
+                name, " rows must be contiguous [KV heads, 128]");
+  }
+  TORCH_CHECK(key.stride(0) == value.stride(0),
+              "key and value must share the token stride");
   check_tensor(cache, key, at::kShort, "packed cache");
   check_tensor(slots, key, at::kInt, "slot IDs");
   check_tensor(tables, key, at::kInt, "block tables");

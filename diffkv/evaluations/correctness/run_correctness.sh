@@ -2,18 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Correctness: generate until EOS with one KV backend, then score.
-# math500: the 50-problem sample or all 500 problems, output limit 8192.
+# math500: the 50-problem sample or all 500 problems, output limit 8192 by
+# default (at 8192, 86 of 500 fp16 outputs stopped at the limit).
 # gpqa: the 197 questions of benchmarks/gpqa/gpqa_diamond_197.json
 # (gpqa-diamond-127 is left out: its prompt is longer than 1024 tokens), output
 # limit 16384 by default (at 8192, 130 of 197 fp8 outputs stopped at the limit).
 # Engine and generation settings are the same for both benchmarks except the
-# output limit and max_model_len (output limit + 1024).
-# Usage: run_correctness.sh math500 <fp16|diffkv|fp8> <sample50|all500>
+# output limit and max_model_len (output limit + 1024). An output limit above
+# 8192 needs chunked prefill on, since max_num_batched_tokens stays 9216.
+# Usage: run_correctness.sh math500 <fp16|diffkv|fp8> <sample50|all500> \
+#            [output limit, default 8192]
 #        run_correctness.sh gpqa <fp16|diffkv|fp8> [output limit, default 16384]
-# Results: logs/correctness/<UTC>-<sample50|all500>-<backend>/ (math500)
+# Results: logs/correctness/<UTC>-<sample50|all500>-<backend>/ (math500, 8192)
+#          logs/correctness/<UTC>-<sample50|all500>-osl<output limit>-<backend>/
+#          (math500, other limits)
 #          logs/correctness/<UTC>-diamond197-osl<output limit>-<backend>/ (gpqa)
 #   source_hashes.json, outputs.json, console.log, grades.json
 # DIFFKV_GPU picks the GPU (default 0).
+# DIFFKV_CHUNKED_PREFILL=1 splits prompts over steps and adds -chunked to the
+# directory name. DiffKV rejects chunked prompts, so this is for fp16 and fp8.
 set -euo pipefail
 
 benchmark=${1:?benchmark: math500 or gpqa}
@@ -32,8 +39,13 @@ case $benchmark in
       all500) count=500 ;;
       *) echo "unknown problem set: $problem_set" >&2; exit 2 ;;
     esac
-    workload=(--expected-count "$count")
-    name=$problem_set-$backend
+    max_tokens=${4:-8192}
+    workload=(--expected-count "$count" --max-tokens "$max_tokens")
+    if [ "$max_tokens" = 8192 ]; then
+      name=$problem_set-$backend
+    else
+      name=$problem_set-osl$max_tokens-$backend
+    fi
     ;;
   gpqa)
     max_tokens=${3:-16384}
@@ -43,6 +55,10 @@ case $benchmark in
     ;;
   *) echo "unknown benchmark: $benchmark" >&2; exit 2 ;;
 esac
+if [ "${DIFFKV_CHUNKED_PREFILL:-0}" = 1 ]; then
+  workload+=(--chunked-prefill)
+  name=$name-chunked
+fi
 run_dir="$evaluations/logs/correctness/$(date -u +%Y%m%dT%H%M%SZ)-$name"
 mkdir -p "$run_dir"
 
