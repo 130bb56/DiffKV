@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DiffKV attention with chunked prefill and the native GQA decode kernels."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -34,6 +35,13 @@ class _BatchState:
     scheduled: dict[str, int]
     dummy: bool
     decode_bounds: list[int] = field(default_factory=list)
+    # Decode inputs shared by every layer, built once per batch without a sync.
+    decode_ids: list[str] = field(default_factory=list)
+    decode_slots: torch.Tensor | None = None
+    decode_positions: torch.Tensor | None = None
+    # Query rows of the decode requests; None when they are rows 0..n-1.
+    decode_rows: torch.Tensor | None = None
+    decode_workspace: tuple[torch.Tensor, ...] | None = None
     compressed_layers: dict[str, set[int]] = field(default_factory=dict)
     executed_layers: set[int] = field(default_factory=set)
 
@@ -41,6 +49,13 @@ class _BatchState:
 _controller: DiffKVCacheController | None = None
 _layer_indices: dict[str, int] = {}
 _batch_state: _BatchState | None = None
+
+
+def _num_partitions(bound: int) -> int:
+    """Partition count the decode kernels use for a retained-length bound."""
+    if bound <= PARTITION_SIZE:
+        return 1
+    return (bound + PARTITION_SIZE - 1) // PARTITION_SIZE + 1
 
 
 def set_controller(
@@ -79,7 +94,7 @@ def set_batch_state(
     controller = _controller
     if controller is None:
         raise RuntimeError("DiffKV worker cache was not initialized")
-    decode_ids = []
+    decode_ids, decode_rows, row = [], [], 0
     for req_id in req_ids:
         request = controller.requests[req_id]
         start, count = computed[req_id], scheduled[req_id]
@@ -98,18 +113,27 @@ def set_batch_state(
             if count != 1:
                 raise ValueError("DiffKV currently supports one decode token per step")
             decode_ids.append(req_id)
+            decode_rows.append(row)
+        row += count
     if decode_ids:
-        controller.append_decode(decode_ids)
-        slots = [controller.requests[req_id].slot_id for req_id in decode_ids]
-        # One transfer serves all layers; retained lengths never replace positions.
-        state.decode_bounds = (
-            controller.kv_len_tables[slots].sum(dim=-1).amax(dim=(0, 2)).cpu().tolist()
+        slots = controller.metadata(decode_ids).slot_ids
+        # Retained lengths bound the attention partitions; never positions.
+        state.decode_bounds = controller.append_decode(decode_ids, slots)
+        state.decode_ids = decode_ids
+        state.decode_slots = slots
+        state.decode_positions = controller.device_tensor(
+            [computed[req_id] for req_id in decode_ids], torch.int32
         )
+        if decode_rows != list(range(len(decode_rows))):
+            state.decode_rows = controller.device_tensor(decode_rows, torch.long)
     _batch_state = state
 
 
-def finish_batch() -> dict[str, Any] | None:
-    """Commit a completed forward, reclaim prompt storage, and report usage."""
+def finish_batch() -> Callable[[], dict[str, Any]] | None:
+    """Commit a completed forward, reclaim prompt storage, and start the report.
+
+    The returned call waits for the report's device read and returns it.
+    """
     global _batch_state
     state = _batch_state
     if state is None or state.dummy:
@@ -137,7 +161,7 @@ def finish_batch() -> dict[str, Any] | None:
             req_id, state.computed[req_id] + state.scheduled[req_id]
         )
     _batch_state = None
-    return controller.report()
+    return controller.report_async()
 
 
 @dataclass
@@ -402,15 +426,13 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
         layer_index = _layer_indices[layer.layer_name]
         if layer_index in state.executed_layers:
             raise RuntimeError("DiffKV attention layer executed twice in one batch")
-        decode_rows = []
-        decode_ids = []
-        for row, req_id in enumerate(state.request_ids):
-            start, end = attn_metadata.query_offsets[row : row + 2]
+        num_decodes = len(state.decode_ids)
+        has_prefill = num_decodes < len(state.request_ids)
+        for row, req_id in enumerate(state.request_ids if has_prefill else ()):
             request = controller.requests[req_id]
             if request.phase == "decode":
-                decode_rows.append(start)
-                decode_ids.append(req_id)
                 continue
+            start, end = attn_metadata.query_offsets[row : row + 2]
             prefix_start = state.computed[req_id]
             prefix_end = prefix_start + state.scheduled[req_id]
             raw = controller.raw_prompt(req_id)[layer_index]
@@ -433,18 +455,35 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
             if prefix_end == request.prompt_len:
                 self._compress_prompt(controller, req_id, layer_index, raw, scores)
                 state.compressed_layers.setdefault(req_id, set()).add(layer_index)
-        if decode_ids:
-            row_indices = torch.tensor(decode_rows, device=q.device, dtype=torch.long)
-            decode_output = self._decode(
-                controller,
-                state,
-                layer_index,
-                decode_ids,
-                q[row_indices].contiguous(),
-                k[row_indices].contiguous(),
-                v[row_indices].contiguous(),
-            )
-            out.index_copy_(0, row_indices, decode_output)
+        if num_decodes:
+            rows = state.decode_rows
+            if rows is None:
+                # The kernel reads strided query rows and writes into out.
+                self._decode(
+                    controller,
+                    state,
+                    layer_index,
+                    q[:num_decodes],
+                    k[:num_decodes].contiguous(),
+                    v[:num_decodes].contiguous(),
+                    out[:num_decodes],
+                )
+            else:
+                decode_output = torch.empty(
+                    (num_decodes, self.num_heads, self.head_size),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                self._decode(
+                    controller,
+                    state,
+                    layer_index,
+                    q[rows],
+                    k[rows],
+                    v[rows],
+                    decode_output,
+                )
+                out.index_copy_(0, rows, decode_output)
         state.executed_layers.add(layer_index)
         return output
 
@@ -482,15 +521,10 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
                 raw[0], raw[1], maximum.unsqueeze(0), sorted_indices, *common
             )
 
-    def _decode(self, controller, state, layer_index, req_ids, query, key, value):
+    def _decode(self, controller, state, layer_index, query, key, value, output):
         extension = get_extension()
-        batch_size = len(req_ids)
-        slots = controller.metadata(req_ids).slot_ids
-        positions = torch.tensor(
-            [state.computed[req_id] for req_id in req_ids],
-            dtype=torch.int32,
-            device=query.device,
-        )
+        slots = state.decode_slots
+        positions = state.decode_positions
         retained_bound = state.decode_bounds[layer_index]
         extension.cache_ops.compress_and_append_cache_decode_phase(
             key,
@@ -506,24 +540,24 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
             layer_index,
             *QUANT_ARGS,
         )
+        if state.decode_workspace is None:
+            # Sized for the longest layer and reused by all layers of the batch.
+            # The kernels index these buffers by the partition count derived
+            # from the bound passed per layer, not by tensor shape.
+            rows = query.shape[0] * self.num_heads
+            longest = max(state.decode_bounds) + 1
+            partitions = _num_partitions(longest)
+            device = query.device
+            state.decode_workspace = (
+                torch.empty(rows * partitions, dtype=torch.float32, device=device),
+                torch.empty(rows * partitions, dtype=torch.float32, device=device),
+                torch.empty(
+                    rows * partitions * self.head_size, dtype=query.dtype, device=device
+                ),
+                torch.empty(rows * longest, dtype=torch.float32, device=device),
+            )
+        sums, maxima, partial_output, scores = state.decode_workspace
         bound = retained_bound + 1
-        num_partitions = (
-            1
-            if bound <= PARTITION_SIZE
-            else (bound + PARTITION_SIZE - 1) // PARTITION_SIZE + 1
-        )
-        output = torch.empty_like(query)
-        shape = (batch_size, self.num_heads, num_partitions)
-        sums = torch.empty(shape, dtype=torch.float32, device=query.device)
-        maxima = torch.empty_like(sums)
-        partial_output = torch.empty(
-            (*shape, self.head_size), dtype=query.dtype, device=query.device
-        )
-        scores = torch.empty(
-            (batch_size, self.num_heads, bound),
-            dtype=torch.float32,
-            device=query.device,
-        )
         extension.ops.sparse_paged_attention_gqa(
             slots,
             positions,
@@ -543,4 +577,3 @@ class DiffKVImpl(AttentionImpl[DiffKVMetadata]):
             *QUANT_ARGS,
             None,
         )
-        return output

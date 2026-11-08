@@ -8,6 +8,7 @@ remain independent of the per-head retained lengths written by those kernels.
 """
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -233,13 +234,16 @@ class DiffKVCacheController:
         self._tail = (self._tail + count) % self.num_pages
         self._free_page_count += count
 
+    def device_tensor(self, values: list[int], dtype: torch.dtype) -> torch.Tensor:
+        """Copy host integers through pinned memory without blocking the CPU."""
+        host = torch.tensor(values, dtype=dtype, pin_memory=self.device.type == "cuda")
+        return host.to(self.device, non_blocking=True)
+
     def _slot_ids(self, request_ids: list[str] | tuple[str, ...]) -> torch.Tensor:
         if len(request_ids) != len(set(request_ids)):
             raise ValueError("Duplicate DiffKV request IDs")
-        return torch.tensor(
-            [self.requests[req_id].slot_id for req_id in request_ids],
-            dtype=torch.int32,
-            device=self.device,
+        return self.device_tensor(
+            [self.requests[req_id].slot_id for req_id in request_ids], torch.int32
         )
 
     def begin_request(
@@ -386,17 +390,24 @@ class DiffKVCacheController:
             state.phase = "decode"
         return released
 
-    def append_decode(self, request_ids: list[str]) -> int:
-        """Reserve space for one decode token per request before attention."""
+    def append_decode(
+        self, request_ids: list[str], slot_ids: torch.Tensor | None = None
+    ) -> list[int]:
+        """Reserve space for one decode token per request before attention.
+
+        Returns each layer's longest retained length over the requests and KV
+        heads, read in the same device-to-host copy as the page count.
+        """
         if not request_ids:
-            return 0
+            return []
         for req_id in request_ids:
             state = self.requests[req_id]
             if state.phase != "decode":
                 raise ValueError("DiffKV decode requires a finalized prompt")
             if state.num_computed_tokens >= self.max_model_len:
                 raise ValueError("DiffKV decode exceeds the model context limit")
-        slot_ids = self._slot_ids(request_ids)
+        if slot_ids is None:
+            slot_ids = self._slot_ids(request_ids)
         offsets = torch.zeros(
             len(request_ids) * self.num_kv_caches * 2 + 1,
             dtype=torch.int32,
@@ -416,7 +427,12 @@ class DiffKVCacheController:
             offsets,
         )
         offsets.cumsum_(dim=0)
-        required = int(offsets[-1].item()) - self._head
+        # Neither append kernel writes kv_len_tables.
+        bounds = (
+            self.kv_len_tables.index_select(0, slot_ids).sum(dim=-1).amax(dim=(0, 2))
+        )
+        values = torch.cat((offsets[-1:].long(), bounds)).tolist()
+        required = values[0] - self._head
         self._take_pages(required)
         self.mem_ops.append_seqs(
             slot_ids,
@@ -427,7 +443,7 @@ class DiffKVCacheController:
             self.block_refs,
             offsets,
         )
-        return required
+        return values[1:]
 
     def free_request(self, request_id: str) -> int:
         """Release packed and raw storage; unknown/already freed IDs are a no-op."""
@@ -478,23 +494,40 @@ class DiffKVCacheController:
 
     def report(self) -> dict[str, Any]:
         """Return synchronized physical usage and contiguous admission capacity."""
+        return self.report_async()()
+
+    def report_async(self) -> Callable[[], dict[str, Any]]:
+        """Start reading packed page counts; the returned call waits and reports.
+
+        Host-side fields are captured now, so the report describes this point
+        on the stream even if the controller changes before the call.
+        """
         if self._contiguity_dirty:
             self._find_free_run(1)
         req_ids = list(self.requests)
-        slots = [self.requests[req_id].slot_id for req_id in req_ids]
-        packed_counts = self.block_num_tables[slots].sum(dim=(1, 2, 3)).tolist()
-        usage = {}
-        for req_id, packed_pages in zip(req_ids, packed_counts):
-            state = self.requests[req_id]
-            usage[req_id] = {
+        counts = None
+        if req_ids:
+            slots = self._slot_ids(req_ids)
+            packed = self.block_num_tables.index_select(0, slots).sum(dim=(1, 2, 3))
+            counts = torch.empty(
+                len(req_ids), dtype=packed.dtype, pin_memory=self.device.type == "cuda"
+            )
+            counts.copy_(packed, non_blocking=True)
+        done = None
+        if self.device.type == "cuda":
+            done = torch.cuda.Event()
+            done.record()
+        usage = {
+            req_id: {
                 "slot_id": state.slot_id,
                 "prompt_len": state.prompt_len,
                 "num_computed_tokens": state.num_computed_tokens,
                 "phase": state.phase,
-                "packed_pages": packed_pages,
                 "raw_pages": state.raw_page_count,
             }
-        return {
+            for req_id, state in self.requests.items()
+        }
+        report = {
             "total_pages": self.num_pages,
             "free_pages": self.free_pages,
             "largest_free_run": self._largest_free_run,
@@ -502,3 +535,14 @@ class DiffKVCacheController:
             "preemptions": self.preemptions,
             "requests": usage,
         }
+
+        def finish() -> dict[str, Any]:
+            if done is not None:
+                done.synchronize()
+            for req_id, packed_pages in zip(
+                req_ids, [] if counts is None else counts.tolist()
+            ):
+                usage[req_id]["packed_pages"] = packed_pages
+            return report
+
+        return finish

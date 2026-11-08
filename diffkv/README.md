@@ -11,6 +11,7 @@ diffkv/
 ├── csrc/                             DiffKV CUDA kernel과 binding
 ├── docs/DiffKV.pdf                   논문 (git 제외)
 └── benchmarks/
+    ├── evaluation/                   lock_clock.sh (clock 고정, 냉각 대기, telemetry, throttle 판정과 재실행), record_telemetry.py, check_throttle.py
     ├── math500/
     │   ├── generate.py               backend 하나로 문항 생성, 요청별 시간 기록
     │   ├── generation_utils.py       backend 옵션, 문항 읽기, 지표 요약
@@ -18,7 +19,7 @@ diffkv/
     │   ├── test_generation.py        CPU test
     │   ├── problems/                 Correctness test를 위한 benchmark dataset
     │   ├── correctness/              run_correctness.sh, score_outputs.py (답 추출, 정답 판정, 집계)
-    │   ├── serving/offline/
+    │   ├── serving/offline/          run_offline_serving.sh, analyze_nsys_steps.py (nsys step별 GPU 시간 분해)
     │   ├── serving/online/           
     │   └── logs/
     └── attention/
@@ -45,8 +46,10 @@ diffkv/
 - venv: `.venv` (container 안 Python 3.12). `site-packages/diffkv.pth`가 `diffkv/python`과 `diffkv/benchmarks`를 import 경로에 넣음
 - CUDA toolkit: `.toolchains/cuda-12.9`, uv: `.toolchains/uv`
 - Nsight Systems: `run_docker.sh`가 host의 `/opt/nvidia/nsight-systems-cli/2024.4.1`을 container에 read-only로 mount (환경 변수 `DIFFKV_NSYS_DIR`로 변경)
+- Nsight Compute: `run_docker.sh`가 host의 `/opt/nvidia/nsight-compute/2023.3.0`을 container에 read-only로 mount (환경 변수 `DIFFKV_NCU_DIR`로 변경). driver가 GPU 성능 counter를 관리자만 읽게 설정돼 있어서(`RmProfilingAdminOnly: 1`) ncu는 `DIFFKV_SYS_ADMIN=1`이 있어야 동작. 이 모드는 container를 `--cap-add=SYS_ADMIN`과 root로 실행함. container 안 일반 사용자 프로세스에는 `--cap-add`로 준 권한이 적용되지 않아 `ERR_NVGPUCTRPERM`이 남. `run_offline_serving.sh`는 profile 실행이 끝나면 결과 디렉터리의 파일 소유자를 실행한 사용자로 되돌림
 - 모델: `models/DeepSeek-R1-Distill-Llama-8B`
 - GPU: 환경 변수 `DIFFKV_GPU` (기본 0)
+- git worktree에서 실행할 때: worktree 루트의 `.venv`, `.toolchains`, `models`, `.cache`와 `vllm/` 안의 미리 빌드된 파일(`git status --ignored vllm`으로 보이는 `.so`, `_version.py`, `third_party/` 등)을 기본 checkout으로 가리키는 symlink로 만들어 둠. `run_docker.sh`는 기본 checkout을 read-only로(`.cache`만 쓰기 가능) 같이 mount하고, `PYTHONPATH`로 worktree의 `diffkv`와 `vllm`을 먼저 import함
 
 ## 실행 명령
 
@@ -60,6 +63,8 @@ repo 루트에서 실행합니다.
 | attention profile (Nsight Systems) | `bash diffkv/benchmarks/attention/run_profile.sh [batch ...]` (기본 1 8 50, KV 길이 512 2048 8192) |
 | correctness | `bash diffkv/benchmarks/math500/correctness/run_correctness.sh <fp16\|diffkv\|fp8> <sample50\|all500>` |
 | offline serving | `bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>` |
+| offline serving step 분해 (Nsight Systems) | `DIFFKV_NSYS_STEPS="<첫 step> <step 수>" bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <fp16\|diffkv\|fp8>`: 측정 구간의 engine step(0부터 셈) 중 지정한 구간만 trace하고 그 뒤 실행을 멈춤. 결과 디렉터리 이름에 `-nsys-s<첫 step>-n<step 수>`, `trace.nsys-rep`, `trace.sqlite`, `step_breakdown.json`(step별 wall 시간, GPU busy와 idle 시간, kernel 종류별 시간, 동기화 API 호출 수) 추가 |
+| offline serving kernel 분석 (Nsight Compute) | `DIFFKV_NCU_STEPS="<첫 step> <step 수>" bash diffkv/benchmarks/math500/serving/offline/run_offline_serving.sh <diffkv\|fp8>`: 지정한 연속 engine step마다 decoder layer 0의 attention module이 실행하는 attention, reduce, KV cache 쓰기 kernel(`register_gqa_attention_kernel`, `register_gqa_reduce_kernel`, `compress_and_append_cache_decode_phase`, FlashInfer attention, `reshape_and_cache`)만 `--set full`로 재고 실행을 멈춤. `generate.py --profile-first-layer`가 layer 0 attention module 앞뒤에서 `cudaProfilerStart`와 `cudaProfilerStop`을 호출하고 ncu는 `--profile-from-start off`로 그 사이만 잼. 결과 디렉터리 이름에 `-ncu-s<첫 step>-n<step 수>`, `kernels.ncu-rep`, `kernels_raw.csv`, `kernel_summary.json`(kernel별로 모든 step의 평균: 시간, DRAM 사용률, occupancy, register, stall 이유, pipe 사용률) 추가 |
 | 두 실행 비교 | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/serving/offline/compare_offline_serving.py --reference <기준 outputs.json> --candidate <비교 outputs.json> --reference-backend <backend> --candidate-backend <backend>` |
 | harness test | `bash diffkv/run_docker.sh python diffkv/benchmarks/math500/test_generation.py` |
 
@@ -75,7 +80,25 @@ repo 루트에서 실행합니다.
 - 엔진 설정: eager, chunked prefill on, async scheduling off, prefix caching off, max_model_len 9216, max_num_batched_tokens 9216, max_num_seqs 64, gpu_memory_utilization 0.9
 - DiffKV: K8V4와 K4V2, threshold `[0.02, 1.0]`, buffer 64 token
 - FP8: FlashInfer, `fp8_e4m3` KV cache, scale 1.0
-- clock 고정은 docker(`--cap-add=SYS_ADMIN`)로 `nvidia-smi -lgc 1395,1395` 실행
+- clock 고정, telemetry, throttle 판정은 `diffkv/benchmarks/evaluation/lock_clock.sh`가 함: GPU를 다른 프로세스가 쓰고 있으면 중단 → `nvidia-smi base-clocks` 값(1395 MHz)으로 고정 → 30초 이상, 그리고 1395 MHz이고 70°C 이하이고 thermal과 power 제한이 없을 때까지 대기(`origin/main` `cool_before_measurement`와 같은 방식) → 실행. 실행 중 telemetry를 1초마다 보고 thermal, power, `hw_slowdown`, `sync_boost` flag나 1395 MHz가 아닌 SM clock이 보이면 바로 kill하고 식힌 뒤 다시 실행(최대 3회), GPU 사용률이 10분(`DIFFKV_STUCK_S`, 지난 정상 실행의 최장 0% 구간은 엔진 초기화 327초) 동안 0%면 kill하고 exit 5 → 끝난 실행 구간 전체를 같은 기준으로 다시 판정해 valid가 아니면 식힌 뒤 다시 실행. 결과 디렉터리에 `gpu_telemetry.jsonl`, `clock_check.json`, `cpu_time.json`, kill한 경우 `throttled.json` 또는 `stuck.json`
+- `cpu_time.json`: 실행마다 한 줄, 그 실행 동안 쓴 CPU 시간(ms) → `command` 측정 명령의 container, `watcher` watcher(`check_throttle.py watch`) container, `watcher_host` watcher를 띄운 host 쪽 `run_docker.sh`와 docker client, `poll_loop` `lock_clock.sh`가 1초마다 kill 조건을 확인하는 loop와 그 loop의 `sleep`, `recorder` recorder(`record_telemetry.py`) container
+- `cpu_time.json` 값 출처: container는 docker cgroup의 `cpuacct.usage`(측정 명령의 container는 끝나면 cgroup이 사라져서 1초마다 읽은 값 중 마지막 값), host 쪽 process는 `/proc/<pid>/stat`
+
+### offline serving의 step별 동시 decode 요청 수
+
+`serving/offline/output_lengths_sample50.json`의 요청별 출력 길이에서 계산한 값. step은 측정 구간의 engine step(0부터 셈), 요청 수는 출력 길이가 그 step보다 긴 요청 수. DiffKV가 처음 약 50 step 동안 새 요청을 step마다 하나씩만 받는 것과 FP8의 preemption은 빠져 있음. 실제 값은 nsys 실행의 `outputs.json` `profile.per_step`에 step마다 기록됨. 문맥 길이는 prompt 길이(32~776 token, 중앙값 83)에 step을 더한 값
+
+| step | 0~783 | 1000 | 1500 | 2000 | 2500 | 3000 | 3500 | 4000 | 5000 | 6000 | 7000 | 7348~8191 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 동시 decode 요청 | 50 | 46 | 40 | 27 | 25 | 20 | 19 | 17 | 14 | 13 | 12 | 11 |
+
+nsys step 분해 구간 (2026-11-03): 동시 decode 요청이 가장 많은 구간, 중간 구간, 가장 적은 구간에서 32 step씩
+
+| 구간 | `DIFFKV_NSYS_STEPS` | 동시 decode 요청 |
+| --- | --- | --- |
+| 최대 | `740 32` | 50 |
+| 중간 | `3000 32` | 20 |
+| 최소 | `7800 32` | 11 |
 
 ## 제한
 
