@@ -41,7 +41,7 @@ ROOT = HERE.parents[2]
 PROMPT_TOKENS = 1024
 
 
-def engine_options(model, max_tokens, chunked_prefill=False):
+def engine_options(model, max_tokens):
     return {
         "model": str(model.resolve()),
         "tokenizer": str(model.resolve()),
@@ -54,8 +54,7 @@ def engine_options(model, max_tokens, chunked_prefill=False):
         "max_num_seqs": 64,
         "gpu_memory_utilization": 0.9,
         "enforce_eager": True,
-        # Whole prompts per step; DiffKV prefill runs prompt_prefill on them.
-        "enable_chunked_prefill": chunked_prefill,
+        "enable_chunked_prefill": True,
         "async_scheduling": False,
         "enable_prefix_caching": False,
         "speculative_config": None,
@@ -189,12 +188,6 @@ def parse_args():
         default=8192,
         help=f"output token limit; max_model_len adds {PROMPT_TOKENS} prompt tokens",
     )
-    parser.add_argument(
-        "--chunked-prefill",
-        action="store_true",
-        help="split prompts over steps; DiffKV rejects chunked prompts, so this "
-        "is for fp16 and fp8 only",
-    )
     parser.add_argument("--mode", choices=("natural", "length_replay"), required=True)
     parser.add_argument("--lengths-from", type=Path)
     parser.add_argument(
@@ -258,7 +251,7 @@ def main():
             raise ValueError(
                 f"Input plus output exceeds {max_model_len}: {row['request_id']}"
             )
-    options = engine_options(args.model, args.max_tokens, args.chunked_prefill)
+    options = engine_options(args.model, args.max_tokens)
     options.update(backend_options(args.backend))
     metadata = {
         "backend": args.backend,
@@ -281,9 +274,10 @@ def main():
         else None,
         "runner_sha256": sha256(__file__),
         "implementation_limits": {
-            "new_request_admissions_per_step": None,
-            "note": "DiffKV admits new requests like the native scheduler; its "
-            "CPU-side reservation only tracks packed physical pages.",
+            "new_request_admissions_per_step": 1 if args.backend == "diffkv" else None,
+            "note": "DiffKV reserves one contiguous raw prefill allocation per "
+            "step; existing decode requests remain batched. This serving cost "
+            "is included in the comparison with the native scheduler.",
         },
         "definitions": {
             "arrival": "All requests registered before the first engine step",
